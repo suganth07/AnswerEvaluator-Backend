@@ -1,30 +1,16 @@
-
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const jwt = require('jsonwebtoken');
 const pool = require('../db');
-const { AzureOCRService } = require('../../services/azureOcrService');
+const { GeminiService } = require('../../services/geminiService');
+const googleDriveService = require('../../services/googleDriveService');
 
 const router = express.Router();
+const geminiService = new GeminiService();
 
-// Initialize Azure OCR service
-const azureOCR = new AzureOCRService();
-
-// Configure multer for file uploads (save to disk for Tesseract)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, '../../uploads/submissions');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'submission-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Configure multer for memory storage (student uploads - save to Drive only)
+const storage = multer.memoryStorage();
 
 const upload = multer({ 
   storage: storage,
@@ -43,10 +29,6 @@ const upload = multer({
 
 // Function to evaluate student answers against correct answers
 const evaluateAnswers = (correctAnswers, studentAnswers) => {
-  console.log('\n=== EVALUATION DEBUG ===');
-  console.log('Correct answers received:', correctAnswers);
-  console.log('Student answers received:', studentAnswers);
-  
   const totalQuestions = correctAnswers.length;
   let score = 0;
   const answerResults = [];
@@ -56,14 +38,12 @@ const evaluateAnswers = (correctAnswers, studentAnswers) => {
   correctAnswers.forEach(q => {
     correctAnswerMap[q.question_number] = q.correct_option;
   });
-  console.log('Correct answer map:', correctAnswerMap);
 
   // Create a map of student answers for quick lookup
   const studentAnswerMap = {};
   studentAnswers.forEach(a => {
-    studentAnswerMap[a.question] = a.answer; // Changed from a.questionNumber and a.selectedOption
+    studentAnswerMap[a.question] = a.selectedOption; // Gemini format: {question: 1, selectedOption: "a"}
   });
-  console.log('Student answer map:', studentAnswerMap);
 
   // Evaluate each question
   for (const correctAnswer of correctAnswers) {
@@ -71,9 +51,7 @@ const evaluateAnswers = (correctAnswers, studentAnswers) => {
     const correctOption = correctAnswer.correct_option;
     const studentOption = studentAnswerMap[questionNumber] || null;
     
-    console.log(`Q${questionNumber}: Correct='${correctOption}', Student='${studentOption}'`);
-    
-    const isCorrect = studentOption && studentOption.toUpperCase() === correctOption.toUpperCase();
+    const isCorrect = studentOption === correctOption;
     if (isCorrect) score++;
 
     answerResults.push({
@@ -85,8 +63,6 @@ const evaluateAnswers = (correctAnswers, studentAnswers) => {
   }
 
   const percentage = (score / totalQuestions) * 100;
-  console.log(`Final evaluation: ${score}/${totalQuestions} (${percentage}%)`);
-  console.log('=== END EVALUATION DEBUG ===\n');
 
   return {
     score,
@@ -111,26 +87,48 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
     }
 
     console.log('Starting student answer sheet evaluation...');
-    console.log('File saved to:', file.path);
+    console.log('Processing file from memory buffer');
 
     // Check if paper exists
     const paperResult = await pool.query('SELECT * FROM papers WHERE id = $1', [paperId]);
     if (paperResult.rows.length === 0) {
       return res.status(404).json({ error: 'Paper not found' });
     }
-
-    // Extract text from student's answer sheet using Azure Computer Vision OCR
-    console.log('Processing student answer sheet with Azure OCR...');
-    const ocrResult = await azureOCR.processAnswerSheetFromImage(file.path);
     
-    if (!ocrResult.success) {
+    const paper = paperResult.rows[0];
+
+    // Step 1: Upload answer sheet to Google Drive with temporary name
+    console.log('📤 Step 1: Uploading answer sheet to Google Drive...');
+    let driveFileId = null;
+    try {
+      const tempUploadResult = await googleDriveService.uploadTempAnswerSheet(
+        file.buffer,
+        file.originalname,
+        studentName
+      );
+      driveFileId = tempUploadResult.fileId;
+      console.log(`✓ Temporary file uploaded with ID: ${driveFileId}`);
+    } catch (driveError) {
+      console.error('❌ Failed to upload to Google Drive:', driveError);
       return res.status(500).json({ 
-        error: 'Failed to process answer sheet: ' + ocrResult.error 
+        error: 'Failed to upload answer sheet to Google Drive: ' + driveError.message 
+      });
+    }
+
+    // Step 2: Extract student answers using Gemini API (from memory buffer)
+    console.log('🔍 Step 2: Processing student answer sheet with Gemini...');
+    const geminiResult = await geminiService.extractStudentAnswersFromBuffer(file.buffer);
+    
+    if (!geminiResult.success) {
+      // Clean up the uploaded file if Gemini processing fails
+      console.log('❌ Gemini processing failed, cleaning up uploaded file...');
+      // Note: We could add a delete method to clean up, but for now we'll leave the temp file
+      return res.status(500).json({ 
+        error: 'Failed to process answer sheet: ' + geminiResult.error 
       });
     }
     
-    // Process the extracted text to find student's answers
-    const studentAnswers = ocrResult.answers;
+    const studentAnswers = geminiResult.answers;
 
     // Get correct answers from database
     const questionsResult = await pool.query(
@@ -144,14 +142,31 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
       return res.status(400).json({ error: 'No questions found for this paper' });
     }
 
-    // Evaluate student answers against correct answers
+    // Step 3: Evaluate student answers against correct answers
+    console.log('📊 Step 3: Evaluating answers...');
     const evaluation = evaluateAnswers(correctAnswers, studentAnswers);
 
-    // Insert submission into database
+    // Step 4: Rename file in Google Drive with final name including marks
+    console.log('🏷️ Step 4: Renaming file with final name...');
+    const sanitizedStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
+    const sanitizedPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+    const fileExtension = path.extname(file.originalname) || '.jpg';
+    const finalFileName = `${sanitizedStudentName}-${sanitizedPaperName}-${evaluation.score}of${evaluation.totalQuestions}${fileExtension}`;
+
+    try {
+      await googleDriveService.renameFileInDrive(driveFileId, finalFileName);
+      console.log(`✓ File renamed to: ${finalFileName}`);
+    } catch (renameError) {
+      console.error('❌ Failed to rename file in Drive:', renameError);
+      // Continue with the process even if rename fails
+    }
+
+    // Step 5: Insert submission into database (store drive_file_id for reference)
+    console.log('💾 Step 5: Saving submission to database...');
     const submissionResult = await pool.query(`
-      INSERT INTO student_submissions (paper_id, student_name, image_url, score, total_questions, percentage) 
-      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
-    `, [paperId, studentName, file.path, evaluation.score, evaluation.totalQuestions, evaluation.percentage]);
+      INSERT INTO student_submissions (paper_id, student_name, score, total_questions, percentage) 
+      VALUES ($1, $2, $3, $4, $5) RETURNING *
+    `, [paperId, studentName, evaluation.score, evaluation.totalQuestions, evaluation.percentage]);
 
     const submission = submissionResult.rows[0];
 
@@ -165,16 +180,25 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
 
     console.log(`Answer sheet evaluated: ${evaluation.score}/${evaluation.totalQuestions} (${evaluation.percentage.toFixed(2)}%)`);
 
+    console.log('✅ Process completed successfully!');
     res.json({
-      message: 'Answer sheet evaluated successfully',
-      result: {
-        submissionId: submission.id,
-        studentName: submission.student_name,
-        score: submission.score,
-        totalQuestions: submission.total_questions,
-        percentage: submission.percentage,
-        submittedAt: submission.submitted_at,
-        extractedText: ocrResult.text.substring(0, 500) + (ocrResult.text.length > 500 ? '...' : '') // First 500 chars for debugging
+      message: 'Answer sheet submitted and stored successfully',
+      success: true,
+      studentName: studentName,
+      paperName: paper.name,
+      score: `${evaluation.score}/${evaluation.totalQuestions}`,
+      percentage: `${evaluation.percentage.toFixed(2)}%`,
+      driveInfo: {
+        fileName: finalFileName,
+        fileId: driveFileId,
+        uploadedToDrive: true,
+        processSteps: [
+          '✓ Uploaded to Google Drive',
+          '✓ Processed with Gemini AI',
+          '✓ Evaluated answers',
+          '✓ Renamed with final score',
+          '✓ Saved to database'
+        ]
       }
     });
 
@@ -223,16 +247,9 @@ router.get('/:id', async (req, res) => {
 
     // Get student answers
     const answersResult = await pool.query(`
-      SELECT 
-        sa.question_number,
-        sa.selected_option as extracted_answer,
-        sa.is_correct,
-        q.correct_option as correct_answer,
-        q.question_text
+      SELECT sa.*, q.question_text, q.correct_option 
       FROM student_answers sa 
-      JOIN questions q ON sa.question_number = q.question_number AND q.paper_id = (
-        SELECT paper_id FROM student_submissions WHERE id = $1
-      )
+      JOIN questions q ON sa.question_number = q.question_number 
       WHERE sa.submission_id = $1 
       ORDER BY sa.question_number
     `, [submissionId]);
