@@ -37,3 +37,6 @@ yarn-error.*
 *.tsbuildinfo
 .env
 uploads/
+
+# Google Drive credentials
+config/google-drive-credentials.json
