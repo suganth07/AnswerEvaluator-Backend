@@ -446,4 +446,4 @@ class GoogleDriveService {
   }
 }
 
-module.exports = new GoogleDriveService();
+module.exports = GoogleDriveService;

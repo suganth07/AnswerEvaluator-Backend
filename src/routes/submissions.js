@@ -4,10 +4,11 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 const pool = require('../db');
 const { GeminiService } = require('../../services/geminiService');
-const googleDriveService = require('../../services/googleDriveService');
+const GoogleDriveService = require('../../services/googleDriveService');
 
 const router = express.Router();
 const geminiService = new GeminiService();
+const googleDriveService = new GoogleDriveService();
 
 // Configure multer for memory storage (student uploads - save to Drive only)
 const storage = multer.memoryStorage();
@@ -101,47 +102,17 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
     console.log('📤 Step 1: Uploading answer sheet to Google Drive...');
     let driveFileId = null;
     try {
-      // Set a timeout for the upload operation (30 seconds)
-      const uploadPromise = googleDriveService.uploadTempAnswerSheet(
+      const tempUploadResult = await googleDriveService.uploadTempAnswerSheet(
         file.buffer,
-        file.originalname,
+        `temp-${studentName}-${Date.now()}.png`,
         studentName
       );
-      
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Upload timeout after 30 seconds')), 30000);
-      });
-      
-      const tempUploadResult = await Promise.race([uploadPromise, timeoutPromise]);
-      
       driveFileId = tempUploadResult.fileId;
       console.log(`✓ Temporary file uploaded with ID: ${driveFileId}`);
     } catch (driveError) {
       console.error('❌ Failed to upload to Google Drive:', driveError);
-      
-      // Check if it's a timeout error
-      if (driveError.message.includes('timeout')) {
-        return res.status(408).json({ 
-          error: 'Upload timeout. Please try again with a smaller image or check your internet connection.',
-          errorType: 'UPLOAD_TIMEOUT',
-          userMessage: 'Upload took too long - please try again'
-        });
-      }
-      
-      // Check if it's an authentication error
-      if (driveError.message.includes('Authentication session expired') || 
-          driveError.message.includes('Token refresh failed')) {
-        return res.status(401).json({ 
-          error: 'Your session has expired. Please try submitting your answer sheet again.',
-          errorType: 'AUTH_EXPIRED',
-          userMessage: 'Session expired - please try again'
-        });
-      }
-      
       return res.status(500).json({ 
-        error: 'Failed to upload answer sheet to Google Drive: ' + driveError.message,
-        errorType: 'UPLOAD_FAILED',
-        userMessage: 'Upload failed - please try again'
+        error: 'Failed to upload answer sheet to Google Drive: ' + driveError.message 
       });
     }
 
@@ -150,9 +121,7 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
     const geminiResult = await geminiService.extractStudentAnswersFromBuffer(file.buffer);
     
     if (!geminiResult.success) {
-      // Clean up the uploaded file if Gemini processing fails
-      console.log('❌ Gemini processing failed, cleaning up uploaded file...');
-      // Note: We could add a delete method to clean up, but for now we'll leave the temp file
+      console.log('❌ Gemini processing failed');
       return res.status(500).json({ 
         error: 'Failed to process answer sheet: ' + geminiResult.error 
       });
@@ -176,22 +145,21 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
     console.log('📊 Step 3: Evaluating answers...');
     const evaluation = evaluateAnswers(correctAnswers, studentAnswers);
 
-    // Step 4: Rename file in Google Drive with final name including marks
-    console.log('🏷️ Step 4: Renaming file with final name...');
+    // Step 4: Rename uploaded file with score
+    console.log('🏷️ Step 4: Renaming file with score...');
     const sanitizedStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
     const sanitizedPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
-    const fileExtension = path.extname(file.originalname) || '.jpg';
-    const finalFileName = `${sanitizedStudentName}-${sanitizedPaperName}-${evaluation.score}of${evaluation.totalQuestions}${fileExtension}`;
-
+    const finalFileName = `${sanitizedStudentName}_${sanitizedPaperName}_${evaluation.score}-${evaluation.totalQuestions}.png`;
+    
     try {
       await googleDriveService.renameFileInDrive(driveFileId, finalFileName);
       console.log(`✓ File renamed to: ${finalFileName}`);
     } catch (renameError) {
-      console.error('❌ Failed to rename file in Drive:', renameError);
+      console.error('❌ Failed to rename file:', renameError);
       // Continue with the process even if rename fails
     }
 
-    // Step 5: Insert submission into database (store drive_file_id for reference)
+    // Step 5: Insert submission into database
     console.log('💾 Step 5: Saving submission to database...');
     const submissionResult = await pool.query(`
       INSERT INTO student_submissions (paper_id, student_name, score, total_questions, percentage) 
@@ -214,20 +182,18 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
     res.json({
       message: 'Answer sheet submitted and stored successfully',
       success: true,
-      submissionId: submission.id,  // Add the submission ID
+      submissionId: submission.id,  // Include the submission ID
       studentName: studentName,
       paperName: paper.name,
       score: `${evaluation.score}/${evaluation.totalQuestions}`,
       percentage: `${evaluation.percentage.toFixed(2)}%`,
       driveInfo: {
-        fileName: finalFileName,
-        fileId: driveFileId,
         uploadedToDrive: true,
         processSteps: [
           '✓ Uploaded to Google Drive',
           '✓ Processed with Gemini AI',
           '✓ Evaluated answers',
-          '✓ Renamed with final score',
+          '✓ Final file uploaded with score',
           '✓ Saved to database'
         ]
       }
