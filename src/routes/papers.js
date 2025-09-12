@@ -5,12 +5,14 @@ const fs = require('fs');
 const pool = require('../db');
 const { GeminiService } = require('../../services/geminiService');
 const OMRService = require('../../services/omrService');
+const { FillBlanksService } = require('../../services/fillBlanksService');
 
 const router = express.Router();
 
 // Initialize services
 const geminiService = new GeminiService();
 const omrService = new OMRService();
+const fillBlanksService = require('../../services/fillBlanksService');
 
 // Configure multer for memory storage (admin uploads - no local storage)
 const storage = multer.memoryStorage();
@@ -113,28 +115,67 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
       const file = files[i];
       console.log(`📄 Processing page ${i + 1}/${files.length}...`);
 
-      // First, detect if this page contains OMR-style content
+      // First, detect question format (OMR, traditional, fill-blanks)
       const omrStyleDetection = await omrService.detectOMRStyle(file.buffer);
-      questionTypes.push(omrStyleDetection.question_type);
+      const fillBlanksDetection = await fillBlanksService.detectFillBlanksStyle(file.buffer);
       
-      console.log(`🔍 Page ${i + 1} detected as: ${omrStyleDetection.question_type} (confidence: ${omrStyleDetection.confidence})`);
+      let pageQuestionType = 'traditional';
+      if (fillBlanksDetection.hasFillBlanks && fillBlanksDetection.confidence > 0.7) {
+        pageQuestionType = 'fill_blanks';
+      } else if (omrStyleDetection.question_type === 'omr') {
+        pageQuestionType = 'omr';
+      }
+      
+      questionTypes.push(pageQuestionType);
+      
+      console.log(`🔍 Page ${i + 1} detected as: ${pageQuestionType} (OMR confidence: ${omrStyleDetection.confidence}, Fill-blanks confidence: ${fillBlanksDetection.confidence || 0})`);
 
-      // Extract questions using Gemini (from memory buffer)
-      const geminiResult = await geminiService.extractQuestionPaperFromBuffer(file.buffer);
+      let pageQuestions = [];
 
-      if (geminiResult.success && geminiResult.questions && geminiResult.questions.length > 0) {
+      // Extract questions based on detected type
+      if (pageQuestionType === 'fill_blanks') {
+        // Extract fill-in-the-blanks questions
+        const fillBlanksResult = await fillBlanksService.extractFillBlanksFromBuffer(file.buffer);
+        if (fillBlanksResult.success && fillBlanksResult.questions.length > 0) {
+          pageQuestions = fillBlanksResult.questions.map(q => ({
+            number: q.number,
+            text: q.text,
+            correctAnswer: null, // Fill-blanks don't have single correct answers
+            options: null, // Fill-blanks don't have options
+            questionFormat: 'fill_blanks',
+            blankPositions: q.blankPositions,
+            totalPoints: q.totalPoints || 1
+          }));
+        }
+      } else {
+        // Extract traditional/OMR questions using existing Gemini service
+        const geminiResult = await geminiService.extractQuestionPaperFromBuffer(file.buffer);
+        if (geminiResult.success && geminiResult.questions.length > 0) {
+          pageQuestions = geminiResult.questions.map(q => ({
+            number: q.number,
+            text: q.text,
+            correctAnswer: q.correctAnswer,
+            options: pageQuestionType === 'omr' ? ['A', 'B', 'C', 'D'] : q.options,
+            questionFormat: 'multiple_choice',
+            blankPositions: null,
+            totalPoints: 1
+          }));
+        }
+      }
+
+      if (pageQuestions.length > 0) {
         // Adjust question numbers to continue from previous pages
-        const adjustedQuestions = geminiResult.questions.map(q => ({
+        const adjustedQuestions = pageQuestions.map(q => ({
           ...q,
           number: q.number + totalQuestionsFound,
           page: i + 1, // Track which page this question came from
-          questionType: omrStyleDetection.question_type // Add question type
+          questionType: pageQuestionType // Add question type
         }));
 
         allQuestions = [...allQuestions, ...adjustedQuestions];
-        totalQuestionsFound += geminiResult.questions.length;
+        totalQuestionsFound += pageQuestions.length;
         
-        console.log(`✓ Page ${i + 1}: Found ${geminiResult.questions.length} questions (${omrStyleDetection.question_type})`);
+        console.log(`✓ Page ${i + 1}: Found ${pageQuestions.length} questions (${pageQuestionType})`);
       } else {
         console.log(`⚠️ Page ${i + 1}: No questions found`);
       }
@@ -151,12 +192,15 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
     // Determine overall question type for the paper
     const hasOMR = questionTypes.includes('omr');
     const hasTraditional = questionTypes.includes('traditional');
+    const hasFillBlanks = questionTypes.includes('fill_blanks');
     let overallQuestionType = 'traditional';
     
-    if (hasOMR && hasTraditional) {
+    if ((hasOMR && hasTraditional) || (hasOMR && hasFillBlanks) || (hasTraditional && hasFillBlanks)) {
       overallQuestionType = 'mixed';
     } else if (hasOMR) {
       overallQuestionType = 'omr';
+    } else if (hasFillBlanks) {
+      overallQuestionType = 'fill_blanks';
     }
 
     console.log(`📝 Overall question type determined: ${overallQuestionType}`);
@@ -171,12 +215,28 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
 
     // Insert extracted questions and correct answers
     for (const question of allQuestions) {
-      // Set default options for OMR questions
-      const options = question.questionType === 'omr' ? ['A', 'B', 'C', 'D'] : null;
+      // Set options based on question format
+      let options = null;
+      if (question.questionFormat === 'multiple_choice') {
+        options = question.questionType === 'omr' ? ['A', 'B', 'C', 'D'] : question.options;
+      }
       
       await pool.query(
-        'INSERT INTO questions (paper_id, question_number, question_text, correct_option, page_number, question_type, options) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [paper.id, question.number, question.text, question.correctAnswer, question.page, question.questionType, JSON.stringify(options)]
+        `INSERT INTO questions 
+         (paper_id, question_number, question_text, correct_option, page_number, question_type, options, question_format, blank_positions, points_per_blank) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          paper.id, 
+          question.number, 
+          question.text, 
+          question.correctAnswer, 
+          question.page, 
+          question.questionType,
+          JSON.stringify(options),
+          question.questionFormat || 'multiple_choice',
+          question.blankPositions ? JSON.stringify(question.blankPositions) : null,
+          question.totalPoints || 1
+        ]
       );
     }
 
@@ -238,6 +298,45 @@ router.get('/:id', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error fetching paper details:', error);
     res.status(500).json({ error: 'Failed to fetch paper details' });
+  }
+});
+
+// Delete paper (admin only - requires authentication)
+router.delete('/:id', verifyToken, async (req, res) => {
+  try {
+    const paperId = req.params.id;
+
+    // Check if paper exists
+    const paperResult = await pool.query('SELECT * FROM papers WHERE id = $1', [paperId]);
+    
+    if (paperResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+
+    // Delete related data in the correct order (due to foreign key constraints)
+    
+    // First, delete student answers that reference the submissions
+    await pool.query(`
+      DELETE FROM student_answers 
+      WHERE submission_id IN (
+        SELECT id FROM student_submissions WHERE paper_id = $1
+      )
+    `, [paperId]);
+    
+    // Then delete student submissions
+    await pool.query('DELETE FROM student_submissions WHERE paper_id = $1', [paperId]);
+    
+    // Then delete questions
+    await pool.query('DELETE FROM questions WHERE paper_id = $1', [paperId]);
+    
+    // Finally delete the paper
+    await pool.query('DELETE FROM papers WHERE id = $1', [paperId]);
+
+    console.log(`Paper with ID ${paperId} deleted successfully`);
+    res.json({ message: 'Paper and all related data deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting paper:', error);
+    res.status(500).json({ error: 'Failed to delete paper' });
   }
 });
 

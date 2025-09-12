@@ -6,11 +6,13 @@ const pool = require('../db');
 const { GeminiService } = require('../../services/geminiService');
 const GoogleDriveService = require('../../services/googleDriveService');
 const OMRService = require('../../services/omrService');
+const { FillBlanksService } = require('../../services/fillBlanksService');
 
 const router = express.Router();
 const geminiService = new GeminiService();
 const googleDriveService = new GoogleDriveService();
 const omrService = new OMRService();
+const fillBlanksService = require('../../services/fillBlanksService');
 
 // Configure multer for memory storage (student uploads - save to Drive only)
 const storage = multer.memoryStorage();
@@ -31,7 +33,13 @@ const upload = multer({
 });
 
 // Function to evaluate student answers against correct answers
-const evaluateAnswers = (correctAnswers, studentAnswers) => {
+const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multiple_choice') => {
+  if (questionFormat === 'fill_blanks') {
+    // Use fill-blanks specific evaluation
+    return fillBlanksService.evaluateFillBlanks(correctAnswers, studentAnswers);
+  }
+
+  // Traditional multiple choice evaluation
   const totalQuestions = correctAnswers.length;
   let score = 0;
   const answerResults = [];
@@ -167,15 +175,34 @@ router.post('/submit', uploadAnswer, async (req, res) => {
     
     let studentAnswers = [];
     let geminiResult = { success: false };
+    let evaluationMethod = 'traditional';
 
-    if (questionType === 'omr' || questionType === 'mixed') {
-      // Get questions for OMR detection context
-      const questionsResult = await pool.query(
-        'SELECT question_number, question_text, correct_option, options FROM questions WHERE paper_id = $1 ORDER BY question_number',
-        [paperId]
-      );
-      const questions = questionsResult.rows;
+    // Get questions for context
+    const questionsResult = await pool.query(
+      'SELECT question_number, question_text, correct_option, options, question_format, blank_positions FROM questions WHERE paper_id = $1 ORDER BY question_number',
+      [paperId]
+    );
+    const questions = questionsResult.rows;
 
+    // Check if this is a fill-in-the-blanks paper
+    const hasFillBlanks = questions.some(q => q.question_format === 'fill_blanks');
+    
+    if (hasFillBlanks) {
+      // Use fill-in-the-blanks processing
+      try {
+        const fillBlanksResult = await fillBlanksService.extractStudentFillBlanksFromBuffer(file.buffer, questions);
+        if (fillBlanksResult.success && fillBlanksResult.answers.length > 0) {
+          studentAnswers = fillBlanksResult.answers;
+          geminiResult = { success: true, answers: studentAnswers };
+          evaluationMethod = 'fill_blanks_ai';
+          console.log(`✓ Fill-blanks extraction found ${studentAnswers.length} answers`);
+        }
+      } catch (fillBlanksError) {
+        console.error('❌ Fill-blanks extraction failed:', fillBlanksError.message);
+      }
+    }
+    
+    if (!geminiResult.success && (questionType === 'omr' || questionType === 'mixed')) {
       // Use OMR detection for OMR-type papers
       try {
         const omrResult = await omrService.detectOMRAnswers(file.buffer, questions);
@@ -186,6 +213,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
             selectedOption: answer.selected_option?.toUpperCase() || null
           }));
           geminiResult = { success: true, answers: studentAnswers };
+          evaluationMethod = 'omr_detection';
           console.log(`✓ OMR Detection found ${studentAnswers.length} answers`);
         } else {
           console.log('⚠️ OMR detection found no answers, falling back to traditional extraction');
@@ -195,7 +223,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       }
     }
 
-    // Fall back to traditional extraction if OMR failed or for traditional papers
+    // Fall back to traditional extraction if other methods failed
     if (!geminiResult.success) {
       geminiResult = await geminiService.extractStudentAnswersFromBuffer(file.buffer);
       if (geminiResult.success) {
@@ -204,6 +232,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
           question: answer.question,
           selectedOption: answer.selectedOption?.toUpperCase() || null
         }));
+        evaluationMethod = 'gemini_vision';
         console.log(`✓ Traditional extraction found ${studentAnswers.length} answers`);
       }
     }
@@ -216,12 +245,12 @@ router.post('/submit', uploadAnswer, async (req, res) => {
     }
 
     // Get correct answers from database
-    const questionsResult = await pool.query(
-      'SELECT question_number, correct_option FROM questions WHERE paper_id = $1 ORDER BY question_number',
+    const correctAnswersResult = await pool.query(
+      'SELECT question_number, correct_option, question_format, blank_positions FROM questions WHERE paper_id = $1 ORDER BY question_number',
       [paperId]
     );
 
-    const correctAnswers = questionsResult.rows;
+    const correctAnswers = correctAnswersResult.rows;
 
     if (correctAnswers.length === 0) {
       return res.status(400).json({ error: 'No questions found for this paper' });
@@ -229,7 +258,13 @@ router.post('/submit', uploadAnswer, async (req, res) => {
 
     // Step 3: Evaluate student answers against correct answers
     console.log('📊 Step 3: Evaluating answers...');
-    const evaluation = evaluateAnswers(correctAnswers, studentAnswers);
+    
+    // Determine the primary question format for evaluation
+    const questionFormats = correctAnswers.map(q => q.question_format || 'multiple_choice');
+    const hasFillBlanksQuestions = questionFormats.includes('fill_blanks');
+    const primaryFormat = hasFillBlanksQuestions ? 'fill_blanks' : 'multiple_choice';
+    
+    const evaluation = evaluateAnswers(correctAnswers, studentAnswers, primaryFormat);
 
     // Step 4: Rename the temporary file with score information
     console.log('🏷️ Step 4: Renaming file with score information...');
@@ -249,18 +284,37 @@ router.post('/submit', uploadAnswer, async (req, res) => {
     // Step 5: Insert submission into database
     console.log('💾 Step 5: Saving submission to database...');
     const submissionResult = await pool.query(`
-      INSERT INTO student_submissions (paper_id, student_name, score, total_questions, percentage) 
-      VALUES ($1, $2, $3, $4, $5) RETURNING *
-    `, [paperId, studentName, evaluation.score, evaluation.totalQuestions, evaluation.percentage]);
+      INSERT INTO student_submissions (paper_id, student_name, score, total_questions, percentage, evaluation_method) 
+      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
+    `, [paperId, studentName, evaluation.score, evaluation.totalQuestions, evaluation.percentage, evaluationMethod]);
 
     const submission = submissionResult.rows[0];
 
     // Insert individual student answers
-    for (const answerResult of evaluation.answerResults) {
-      await pool.query(`
-        INSERT INTO student_answers (submission_id, question_number, selected_option, is_correct) 
-        VALUES ($1, $2, $3, $4)
-      `, [submission.id, answerResult.questionNumber, answerResult.studentOption?.toUpperCase() || null, answerResult.isCorrect]);
+    if (primaryFormat === 'fill_blanks' && evaluation.results) {
+      // Handle fill-in-the-blanks answers
+      for (const result of evaluation.results) {
+        const studentAnswer = studentAnswers.find(a => a.question === result.questionNumber);
+        await pool.query(`
+          INSERT INTO student_answers (submission_id, question_number, selected_option, is_correct, text_answer, blank_answers) 
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [
+          submission.id, 
+          result.questionNumber, 
+          null, // No selected option for fill-blanks
+          result.score > 0,
+          null, // Legacy field
+          JSON.stringify(studentAnswer?.blankAnswers || [])
+        ]);
+      }
+    } else {
+      // Handle multiple choice answers
+      for (const answerResult of evaluation.answerResults) {
+        await pool.query(`
+          INSERT INTO student_answers (submission_id, question_number, selected_option, is_correct) 
+          VALUES ($1, $2, $3, $4)
+        `, [submission.id, answerResult.questionNumber, answerResult.studentOption?.toUpperCase() || null, answerResult.isCorrect]);
+      }
     }
 
     console.log(`Answer sheet evaluated: ${evaluation.score}/${evaluation.totalQuestions} (${evaluation.percentage.toFixed(2)}%) - ${questionType} type`);
@@ -273,7 +327,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       studentName: studentName,
       paperName: paper.name,
       questionType: questionType,
-      evaluationMethod: questionType === 'omr' ? 'OMR Detection' : 'Traditional Extraction',
+      evaluationMethod: evaluationMethod,
       score: `${evaluation.score}/${evaluation.totalQuestions}`,
       percentage: `${evaluation.percentage.toFixed(2)}%`,
       driveInfo: {
@@ -333,10 +387,11 @@ router.get('/:id', async (req, res) => {
 
     // Get student answers
     const answersResult = await pool.query(`
-      SELECT sa.*, q.question_text, q.correct_option 
+      SELECT sa.*, q.question_text, q.correct_option, q.options, q.question_format
       FROM student_answers sa 
       JOIN questions q ON sa.question_number = q.question_number 
-      WHERE sa.submission_id = $1 
+      JOIN student_submissions s ON sa.submission_id = s.id
+      WHERE sa.submission_id = $1 AND q.paper_id = s.paper_id
       ORDER BY sa.question_number
     `, [submissionId]);
 
