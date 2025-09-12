@@ -119,7 +119,9 @@ class GoogleDriveService {
     try {
       // Create temporary filename
       const timestamp = Date.now();
-      const sanitizedStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
+      // Safely handle studentName - use 'anonymous' if undefined or null
+      const safeName = studentName || 'anonymous';
+      const sanitizedStudentName = safeName.replace(/[^a-zA-Z0-9]/g, '_');
       const fileExtension = path.extname(originalFileName) || '.jpg';
       const tempFileName = `TEMP_${sanitizedStudentName}_${timestamp}${fileExtension}`;
 
@@ -442,6 +444,102 @@ class GoogleDriveService {
       }
 
       throw new Error(`Failed to upload to Google Drive: ${error.message}`);
+    }
+  }
+
+  async uploadFinalAnswerSheet(imageBuffer, studentName, paperName, score, totalQuestions) {
+    if (!this.accessToken) {
+      throw new Error('Google Drive access token not configured');
+    }
+
+    try {
+      // Create final filename with score information
+      const timestamp = Date.now();
+      const safeName = studentName || 'anonymous';
+      const sanitizedStudentName = safeName.replace(/[^a-zA-Z0-9]/g, '_');
+      const sanitizedPaperName = paperName.replace(/[^a-zA-Z0-9]/g, '_');
+      const percentage = Math.round((score / totalQuestions) * 100);
+      const finalFileName = `${sanitizedStudentName}_${sanitizedPaperName}_Score${score}of${totalQuestions}(${percentage}%)_${timestamp}.jpg`;
+
+      console.log(`📤 Uploading final answer sheet to Google Drive: ${finalFileName}`);
+      console.log(`📊 Upload details: File size: ${imageBuffer.length} bytes, Score: ${score}/${totalQuestions} (${percentage}%)`);
+
+      // Function to create form data (needed for retry logic)
+      const createFormData = () => {
+        const form = new FormData();
+        form.append(
+          'metadata',
+          JSON.stringify({
+            name: finalFileName,
+            parents: [this.folderId],
+          }),
+          { contentType: 'application/json' }
+        );
+        form.append('file', imageBuffer, {
+          filename: finalFileName,
+          contentType: 'image/jpeg',
+        });
+        return form;
+      };
+
+      // Try upload with current token
+      let form = createFormData();
+      let response = await fetch(
+        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+            ...form.getHeaders(),
+          },
+          body: form,
+        }
+      );
+
+      console.log(`📡 Final upload response status: ${response.status}`);
+
+      // If token expired, refresh and retry with new FormData
+      if (response.status === 401) {
+        console.log('🔑 Access token expired, attempting to refresh...');
+        await this.refreshAccessToken();
+        
+        // Create fresh FormData for retry (cannot reuse streams)
+        form = createFormData();
+        response = await fetch(
+          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${this.accessToken}`,
+              ...form.getHeaders(),
+            },
+            body: form,
+          }
+        );
+        
+        console.log(`📡 Retry response status: ${response.status}`);
+      }
+
+      if (!response.ok) {
+        const errorData = await response.text();
+        console.error('❌ Google Drive final upload error:', response.status, errorData);
+        throw new Error(`HTTP ${response.status}: ${errorData}`);
+      }
+
+      const result = await response.json();
+      console.log(`✅ Final answer sheet uploaded successfully!`);
+      console.log(`📁 File details: ID=${result.id}, Name=${result.name}`);
+      console.log(`🔗 View link: ${result.webViewLink}`);
+
+      return {
+        id: result.id,
+        name: result.name,
+        webViewLink: result.webViewLink
+      };
+
+    } catch (error) {
+      console.error('❌ Error uploading final answer sheet to Google Drive:', error.message);
+      throw new Error('Failed to upload final answer sheet to Google Drive: ' + error.message);
     }
   }
 }

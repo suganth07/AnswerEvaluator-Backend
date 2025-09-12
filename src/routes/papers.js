@@ -4,11 +4,13 @@ const path = require('path');
 const fs = require('fs');
 const pool = require('../db');
 const { GeminiService } = require('../../services/geminiService');
+const OMRService = require('../../services/omrService');
 
 const router = express.Router();
 
-// Initialize Gemini service
+// Initialize services
 const geminiService = new GeminiService();
+const omrService = new OMRService();
 
 // Configure multer for memory storage (admin uploads - no local storage)
 const storage = multer.memoryStorage();
@@ -16,7 +18,7 @@ const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+    fileSize: 10 * 1024 * 1024 // 10MB limit per file
   },
   fileFilter: (req, file, cb) => {
     const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png'];
@@ -27,6 +29,9 @@ const upload = multer({
     }
   }
 });
+
+// Support multiple files (up to 10 pages)
+const uploadMultiple = upload.array('papers', 10);
 
 // Middleware to verify JWT token
 const verifyToken = (req, res, next) => {
@@ -53,7 +58,7 @@ router.get('/', verifyToken, async (req, res) => {
       SELECT p.*, COUNT(q.id) as question_count 
       FROM papers p 
       LEFT JOIN questions q ON p.id = q.paper_id 
-      GROUP BY p.id 
+      GROUP BY p.id, p.name, p.admin_id, p.uploaded_at, p.total_pages, p.question_type
       ORDER BY p.uploaded_at DESC
     `);
     
@@ -68,10 +73,10 @@ router.get('/', verifyToken, async (req, res) => {
 router.get('/public', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT p.id, p.name, p.uploaded_at, COUNT(q.id) as question_count 
+      SELECT p.id, p.name, p.uploaded_at, p.total_pages, p.question_type, COUNT(q.id) as question_count 
       FROM papers p 
       LEFT JOIN questions q ON p.id = q.paper_id 
-      GROUP BY p.id, p.name, p.uploaded_at 
+      GROUP BY p.id, p.name, p.uploaded_at, p.total_pages, p.question_type
       ORDER BY p.uploaded_at DESC
     `);
     
@@ -83,64 +88,125 @@ router.get('/public', async (req, res) => {
 });
 
 // Upload new paper
-router.post('/upload', verifyToken, upload.single('paper'), async (req, res) => {
+router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
   try {
     const { name } = req.body;
-    const file = req.file;
+    const files = req.files;
 
     if (!name) {
       return res.status(400).json({ error: 'Paper name is required' });
     }
 
-    if (!file) {
-      return res.status(400).json({ error: 'Paper image is required' });
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'At least one paper image is required' });
     }
 
-    console.log('Starting paper upload and processing...');
-    console.log('Processing file from memory buffer');
+    console.log(`Starting multi-page paper upload and processing... (${files.length} pages)`);
+    console.log('Processing files from memory buffers');
 
-    // Extract questions using Gemini (from memory buffer)
-    const geminiResult = await geminiService.extractQuestionPaperFromBuffer(file.buffer);
+    let allQuestions = [];
+    let totalQuestionsFound = 0;
+    let questionTypes = []; // Track question type for each page
 
-    if (!geminiResult.success || !geminiResult.questions || geminiResult.questions.length === 0) {
+    // Process each page
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      console.log(`📄 Processing page ${i + 1}/${files.length}...`);
+
+      // First, detect if this page contains OMR-style content
+      const omrStyleDetection = await omrService.detectOMRStyle(file.buffer);
+      questionTypes.push(omrStyleDetection.question_type);
+      
+      console.log(`🔍 Page ${i + 1} detected as: ${omrStyleDetection.question_type} (confidence: ${omrStyleDetection.confidence})`);
+
+      // Extract questions using Gemini (from memory buffer)
+      const geminiResult = await geminiService.extractQuestionPaperFromBuffer(file.buffer);
+
+      if (geminiResult.success && geminiResult.questions && geminiResult.questions.length > 0) {
+        // Adjust question numbers to continue from previous pages
+        const adjustedQuestions = geminiResult.questions.map(q => ({
+          ...q,
+          number: q.number + totalQuestionsFound,
+          page: i + 1, // Track which page this question came from
+          questionType: omrStyleDetection.question_type // Add question type
+        }));
+
+        allQuestions = [...allQuestions, ...adjustedQuestions];
+        totalQuestionsFound += geminiResult.questions.length;
+        
+        console.log(`✓ Page ${i + 1}: Found ${geminiResult.questions.length} questions (${omrStyleDetection.question_type})`);
+      } else {
+        console.log(`⚠️ Page ${i + 1}: No questions found`);
+      }
+    }
+
+    if (allQuestions.length === 0) {
       return res.status(400).json({ 
-        error: 'No questions found in the image. Please ensure the question paper is clear and contains multiple choice questions with marked correct answers.' 
+        error: 'No questions found in any of the uploaded pages. Please ensure the question papers are clear and contain multiple choice questions with marked correct answers.' 
       });
     }
 
-    const questions = geminiResult.questions;
+    console.log(`📊 Total questions found across all pages: ${allQuestions.length}`);
 
-    // Insert paper into database (no image_url stored locally)
+    // Determine overall question type for the paper
+    const hasOMR = questionTypes.includes('omr');
+    const hasTraditional = questionTypes.includes('traditional');
+    let overallQuestionType = 'traditional';
+    
+    if (hasOMR && hasTraditional) {
+      overallQuestionType = 'mixed';
+    } else if (hasOMR) {
+      overallQuestionType = 'omr';
+    }
+
+    console.log(`📝 Overall question type determined: ${overallQuestionType}`);
+
+    // Insert paper into database with question type
     const paperResult = await pool.query(
-      'INSERT INTO papers (name, admin_id) VALUES ($1, $2) RETURNING *',
-      [name, req.admin.id]
+      'INSERT INTO papers (name, admin_id, total_pages, question_type) VALUES ($1, $2, $3, $4) RETURNING *',
+      [name, req.admin.id, files.length, overallQuestionType]
     );
 
     const paper = paperResult.rows[0];
 
     // Insert extracted questions and correct answers
-    for (const question of questions) {
+    for (const question of allQuestions) {
+      // Set default options for OMR questions
+      const options = question.questionType === 'omr' ? ['A', 'B', 'C', 'D'] : null;
+      
       await pool.query(
-        'INSERT INTO questions (paper_id, question_number, question_text, correct_option) VALUES ($1, $2, $3, $4)',
-        [paper.id, question.number, question.text, question.correctAnswer]
+        'INSERT INTO questions (paper_id, question_number, question_text, correct_option, page_number, question_type, options) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [paper.id, question.number, question.text, question.correctAnswer, question.page, question.questionType, JSON.stringify(options)]
       );
     }
 
-    console.log(`Paper uploaded successfully with ${questions.length} questions extracted`);
+    console.log(`Paper uploaded successfully with ${allQuestions.length} questions across ${files.length} pages`);
 
     res.json({
-      message: 'Paper uploaded and processed successfully',
+      message: 'Multi-page paper uploaded and processed successfully',
       paper: paper,
-      extractedQuestions: questions.length,
-      questionsPreview: questions.map(q => ({
-        question: q.question,
-        text: q.text.substring(0, 100) + '...',
-        correctAnswer: q.correctAnswer
-      }))
+      totalPages: files.length,
+      extractedQuestions: allQuestions.length,
+      questionType: overallQuestionType,
+      questionTypeByPage: questionTypes,
+      questionsPerPage: files.map((_, index) => {
+        const pageQuestions = allQuestions.filter(q => q.page === index + 1);
+        return {
+          page: index + 1,
+          questions: pageQuestions.length,
+          type: questionTypes[index],
+          preview: pageQuestions.slice(0, 2).map(q => ({
+            question: q.number,
+            text: q.text.substring(0, 100) + '...',
+            correctAnswer: q.correctAnswer,
+            type: q.questionType
+          }))
+        };
+      })
     });
 
   } catch (error) {
-    console.error('Error uploading paper:', error);
+    console.error('Error uploading multi-page paper:', error);
     res.status(500).json({ 
       error: 'Failed to upload paper: ' + error.message 
     });

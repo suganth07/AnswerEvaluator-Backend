@@ -5,10 +5,12 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db');
 const { GeminiService } = require('../../services/geminiService');
 const GoogleDriveService = require('../../services/googleDriveService');
+const OMRService = require('../../services/omrService');
 
 const router = express.Router();
 const geminiService = new GeminiService();
 const googleDriveService = new GoogleDriveService();
+const omrService = new OMRService();
 
 // Configure multer for memory storage (student uploads - save to Drive only)
 const storage = multer.memoryStorage();
@@ -43,13 +45,14 @@ const evaluateAnswers = (correctAnswers, studentAnswers) => {
   // Create a map of student answers for quick lookup
   const studentAnswerMap = {};
   studentAnswers.forEach(a => {
-    studentAnswerMap[a.question] = a.selectedOption; // Gemini format: {question: 1, selectedOption: "a"}
+    // Normalize student option to uppercase to match database format
+    studentAnswerMap[a.question] = a.selectedOption?.toUpperCase() || null; // Gemini format: {question: 1, selectedOption: "a"}
   });
 
   // Evaluate each question
   for (const correctAnswer of correctAnswers) {
     const questionNumber = correctAnswer.question_number;
-    const correctOption = correctAnswer.correct_option;
+    const correctOption = correctAnswer.correct_option?.toUpperCase(); // Ensure correct option is uppercase
     const studentOption = studentAnswerMap[questionNumber] || null;
     
     const isCorrect = studentOption === correctOption;
@@ -73,30 +76,73 @@ const evaluateAnswers = (correctAnswers, studentAnswers) => {
   };
 };
 
+// Configure upload middleware to support both single and multiple files
+const uploadAnswer = (req, res, next) => {
+  // Check if this is a multi-page submission
+  if (req.headers['content-type'] && req.headers['content-type'].includes('multipart/form-data')) {
+    // Use multer.any() to handle both single and multiple files dynamically
+    const dynamicUpload = multer({ 
+      storage: storage,
+      limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB limit per file
+      },
+      fileFilter: (req, file, cb) => {
+        const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png'];
+        if (allowedTypes.includes(file.mimetype)) {
+          cb(null, true);
+        } else {
+          cb(new Error('Only JPEG and PNG images are allowed'));
+        }
+      }
+    }).any();
+    
+    dynamicUpload(req, res, next);
+  } else {
+    next();
+  }
+};
+
 // Submit student answer sheet
-router.post('/submit', upload.single('answerSheet'), async (req, res) => {
+router.post('/submit', uploadAnswer, async (req, res) => {
   try {
     const { paperId, studentName } = req.body;
-    const file = req.file;
+    const files = req.files || [];
 
     if (!paperId || !studentName) {
       return res.status(400).json({ error: 'Paper ID and student name are required' });
     }
 
-    if (!file) {
-      return res.status(400).json({ error: 'Answer sheet image is required' });
+    if (files.length === 0) {
+      return res.status(400).json({ error: 'Answer sheet image(s) are required' });
     }
 
-    console.log('Starting student answer sheet evaluation...');
-    console.log('Processing file from memory buffer');
+    console.log(`Starting student answer sheet evaluation... (${files.length} file(s))`);
+    console.log('Processing files from memory buffer');
 
-    // Check if paper exists
+    // Check if paper exists and get its page count and question type
     const paperResult = await pool.query('SELECT * FROM papers WHERE id = $1', [paperId]);
     if (paperResult.rows.length === 0) {
       return res.status(404).json({ error: 'Paper not found' });
     }
     
     const paper = paperResult.rows[0];
+    const expectedPages = paper.total_pages || 1;
+    const questionType = paper.question_type || 'traditional';
+    
+    console.log(`📋 Paper info: ${paper.name} (${questionType} type, ${expectedPages} pages)`);
+    
+    // Validate page count
+    if (files.length !== expectedPages) {
+      return res.status(400).json({ 
+        error: `Page count mismatch: Expected ${expectedPages} page(s) but received ${files.length} file(s)` 
+      });
+    }
+
+    console.log(`✓ Page count validation passed: ${files.length}/${expectedPages} pages`);
+
+    // For now, process only the first file (single-page logic)
+    // TODO: Implement multi-page processing
+    const file = files[0];
 
     // Step 1: Upload answer sheet to Google Drive with temporary name
     console.log('📤 Step 1: Uploading answer sheet to Google Drive...');
@@ -116,18 +162,58 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
       });
     }
 
-    // Step 2: Extract student answers using Gemini API (from memory buffer)
-    console.log('🔍 Step 2: Processing student answer sheet with Gemini...');
-    const geminiResult = await geminiService.extractStudentAnswersFromBuffer(file.buffer);
+    // Step 2: Extract student answers using appropriate method based on question type
+    console.log(`🔍 Step 2: Processing ${questionType} answer sheet with Gemini...`);
     
+    let studentAnswers = [];
+    let geminiResult = { success: false };
+
+    if (questionType === 'omr' || questionType === 'mixed') {
+      // Get questions for OMR detection context
+      const questionsResult = await pool.query(
+        'SELECT question_number, question_text, correct_option, options FROM questions WHERE paper_id = $1 ORDER BY question_number',
+        [paperId]
+      );
+      const questions = questionsResult.rows;
+
+      // Use OMR detection for OMR-type papers
+      try {
+        const omrResult = await omrService.detectOMRAnswers(file.buffer, questions);
+        if (omrResult && omrResult.detected_answers && omrResult.detected_answers.length > 0) {
+          // Convert OMR format to standard format
+          studentAnswers = omrResult.detected_answers.map(answer => ({
+            question: answer.question,
+            selectedOption: answer.selected_option?.toUpperCase() || null
+          }));
+          geminiResult = { success: true, answers: studentAnswers };
+          console.log(`✓ OMR Detection found ${studentAnswers.length} answers`);
+        } else {
+          console.log('⚠️ OMR detection found no answers, falling back to traditional extraction');
+        }
+      } catch (omrError) {
+        console.error('❌ OMR detection failed, falling back to traditional:', omrError.message);
+      }
+    }
+
+    // Fall back to traditional extraction if OMR failed or for traditional papers
     if (!geminiResult.success) {
-      console.log('❌ Gemini processing failed');
+      geminiResult = await geminiService.extractStudentAnswersFromBuffer(file.buffer);
+      if (geminiResult.success) {
+        // Normalize case for traditional extraction results
+        studentAnswers = geminiResult.answers.map(answer => ({
+          question: answer.question,
+          selectedOption: answer.selectedOption?.toUpperCase() || null
+        }));
+        console.log(`✓ Traditional extraction found ${studentAnswers.length} answers`);
+      }
+    }
+
+    if (!geminiResult.success) {
+      console.log('❌ Answer extraction failed');
       return res.status(500).json({ 
-        error: 'Failed to process answer sheet: ' + geminiResult.error 
+        error: 'Failed to process answer sheet: ' + (geminiResult.error || 'No answers detected') 
       });
     }
-    
-    const studentAnswers = geminiResult.answers;
 
     // Get correct answers from database
     const questionsResult = await pool.query(
@@ -145,11 +231,12 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
     console.log('📊 Step 3: Evaluating answers...');
     const evaluation = evaluateAnswers(correctAnswers, studentAnswers);
 
-    // Step 4: Rename uploaded file with score
-    console.log('🏷️ Step 4: Renaming file with score...');
+    // Step 4: Rename the temporary file with score information
+    console.log('🏷️ Step 4: Renaming file with score information...');
     const sanitizedStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
     const sanitizedPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
-    const finalFileName = `${sanitizedStudentName}_${sanitizedPaperName}_${evaluation.score}-${evaluation.totalQuestions}.png`;
+    const percentage = Math.round((evaluation.score / evaluation.totalQuestions) * 100);
+    const finalFileName = `${sanitizedStudentName}_${sanitizedPaperName}_Score${evaluation.score}of${evaluation.totalQuestions}(${percentage}%).jpg`;
     
     try {
       await googleDriveService.renameFileInDrive(driveFileId, finalFileName);
@@ -173,10 +260,10 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
       await pool.query(`
         INSERT INTO student_answers (submission_id, question_number, selected_option, is_correct) 
         VALUES ($1, $2, $3, $4)
-      `, [submission.id, answerResult.questionNumber, answerResult.studentOption, answerResult.isCorrect]);
+      `, [submission.id, answerResult.questionNumber, answerResult.studentOption?.toUpperCase() || null, answerResult.isCorrect]);
     }
 
-    console.log(`Answer sheet evaluated: ${evaluation.score}/${evaluation.totalQuestions} (${evaluation.percentage.toFixed(2)}%)`);
+    console.log(`Answer sheet evaluated: ${evaluation.score}/${evaluation.totalQuestions} (${evaluation.percentage.toFixed(2)}%) - ${questionType} type`);
 
     console.log('✅ Process completed successfully!');
     res.json({
@@ -185,13 +272,15 @@ router.post('/submit', upload.single('answerSheet'), async (req, res) => {
       submissionId: submission.id,  // Include the submission ID
       studentName: studentName,
       paperName: paper.name,
+      questionType: questionType,
+      evaluationMethod: questionType === 'omr' ? 'OMR Detection' : 'Traditional Extraction',
       score: `${evaluation.score}/${evaluation.totalQuestions}`,
       percentage: `${evaluation.percentage.toFixed(2)}%`,
       driveInfo: {
         uploadedToDrive: true,
         processSteps: [
           '✓ Uploaded to Google Drive',
-          '✓ Processed with Gemini AI',
+          `✓ Processed with ${questionType === 'omr' ? 'OMR Detection' : 'Traditional Gemini AI'}`,
           '✓ Evaluated answers',
           '✓ Final file uploaded with score',
           '✓ Saved to database'
