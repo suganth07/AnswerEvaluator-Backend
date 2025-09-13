@@ -88,16 +88,21 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
   // Create a map of correct answers for quick lookup
   const correctAnswerMap = {};
   correctAnswers.forEach(q => {
-    // Support both single and multiple correct answers
+    // PRIORITIZE multiple correct answers from correct_options JSON column
     if (q.correct_options && q.correct_options !== null) {
-      try {
-        const correctOptions = JSON.parse(q.correct_options);
-        correctAnswerMap[q.question_number] = Array.isArray(correctOptions) ? correctOptions : [q.correct_option];
-      } catch (e) {
-        correctAnswerMap[q.question_number] = [q.correct_option];
+      // correct_options is already parsed as array by PostgreSQL JSONB
+      if (Array.isArray(q.correct_options)) {
+        correctAnswerMap[q.question_number] = q.correct_options;
+      } else {
+        // Handle edge case where it might be a single value
+        correctAnswerMap[q.question_number] = [q.correct_options];
       }
-    } else {
+    } else if (q.correct_option && q.correct_option !== null) {
+      // Use single correct_option as fallback
       correctAnswerMap[q.question_number] = [q.correct_option];
+    } else {
+      // No correct answers found
+      correctAnswerMap[q.question_number] = [];
     }
   });
 
@@ -320,7 +325,10 @@ router.post('/submit', uploadAnswer, async (req, res) => {
         // Normalize case for traditional extraction results
         studentAnswers = geminiResult.answers.map(answer => ({
           question: answer.question,
-          selectedOption: answer.selectedOption?.toUpperCase() || null
+          selectedOption: answer.selectedOption?.toUpperCase() || null,
+          selectedOptions: answer.selectedOptions ? 
+            answer.selectedOptions.map(opt => opt.toUpperCase()) : 
+            [answer.selectedOption?.toUpperCase()].filter(Boolean)
         }));
         evaluationMethod = 'gemini_vision';
         console.log(`✓ Traditional extraction found ${studentAnswers.length} answers`);

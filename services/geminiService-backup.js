@@ -17,23 +17,20 @@ class GeminiService {
             try {
                 return await operation();
             } catch (error) {
-                const isRetryable = error.status === 503 || 
-                                  error.status === 429 || 
-                                  error.message.includes('overloaded') ||
-                                  error.message.includes('rate limit') ||
-                                  error.message.includes('Service Unavailable');
+                console.log(`⚠️ ${context} - Attempt ${attempt}/${this.maxRetries} failed:`, error.message);
                 
-                console.log(`⚠️ ${context} - Attempt ${attempt}/${this.maxRetries} failed: ${error.message}`);
-                
-                if (isRetryable && attempt < this.maxRetries) {
-                    const delay = this.retryDelay * Math.pow(2, attempt - 1); // Exponential backoff
-                    console.log(`⏳ Retrying in ${delay}ms...`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                    continue;
-                } else {
-                    console.error(`❌ ${context} - Max retries reached or non-retryable error`);
-                    throw error;
+                // Check if it's a retryable error
+                if (error.status === 503 || error.status === 429 || error.message.includes('overloaded')) {
+                    if (attempt < this.maxRetries) {
+                        const delay = this.retryDelay * Math.pow(2, attempt - 1); // Exponential backoff
+                        console.log(`⏳ Retrying in ${delay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
                 }
+                
+                // If not retryable or max retries reached, throw the error
+                throw error;
             }
         }
     }
@@ -54,8 +51,6 @@ class GeminiService {
             const prompt = `
             Analyze this question paper image and extract all the content in a structured JSON format.
             
-            Look for questions with marked correct answers. Multiple answers may be marked for a single question.
-            
             Please return ONLY valid JSON with this exact structure:
             {
               "questions": [
@@ -68,8 +63,7 @@ class GeminiService {
                     "c": "option c text",
                     "d": "option d text"
                   },
-                  "correctAnswer": "a",
-                  "correctAnswers": ["a"]
+                  "correctAnswer": "a"
                 }
               ]
             }
@@ -77,11 +71,7 @@ class GeminiService {
             Rules:
             - Extract ALL questions you can see in the image
             - Include ALL answer options (a, b, c, d, etc.)
-            - For correctAnswer, put the first correct answer or "unknown" if none marked
-            - For correctAnswers, put an array of ALL marked correct answers (e.g., ["a", "c"] for multiple correct)
-            - If only one correct answer, correctAnswers should be ["a"] (single item array)
-            - If no correct answers are marked, use "unknown" for correctAnswer and [] for correctAnswers  
-            - Look for checkmarks (✓), circles, highlights, or any markings indicating correct answers
+            - For correctAnswer, put "unknown" if no correct answer is marked or indicated
             - Ensure the JSON is valid and properly formatted
             - Do not include any explanatory text, only the JSON
             `;
@@ -93,12 +83,8 @@ class GeminiService {
                 }
             };
 
-            console.log('Sending request to Gemini API with retry mechanism...');
-            
-            const result = await this.withRetry(async () => {
-                return await this.model.generateContent([prompt, imagePart]);
-            }, 'Question Paper Extraction');
-
+            console.log('Sending request to Gemini API...');
+            const result = await this.model.generateContent([prompt, imagePart]);
             const response = await result.response;
             let text = response.text();
 
@@ -153,7 +139,6 @@ class GeminiService {
             - Circles around options
             - Filled bubbles or checkboxes
             - Any other markings that indicate a selected answer
-            - MULTIPLE selections for the same question (students may mark multiple options)
             
             Return ONLY valid JSON with this exact structure:
             {
@@ -161,13 +146,11 @@ class GeminiService {
                 {
                   "question": 1,
                   "selectedOption": "a",
-                  "selectedOptions": ["a"],
                   "confidence": "high"
                 },
                 {
                   "question": 2,
-                  "selectedOption": "b",
-                  "selectedOptions": ["b", "c"], 
+                  "selectedOption": "b", 
                   "confidence": "medium"
                 }
               ]
@@ -176,10 +159,7 @@ class GeminiService {
             Rules:
             - Only include questions where you can clearly see a marked answer
             - Use confidence levels: "high", "medium", "low" based on how clear the marking is
-            - selectedOption should be the first/primary selected option (lowercase a, b, c, d)
-            - selectedOptions should be an array of ALL marked options for that question
-            - If only one option is marked, selectedOptions should be ["a"] (single item array)
-            - If multiple options are marked, include all of them: ["a", "c", "d"]
+            - selectedOption should be lowercase (a, b, c, d)
             - Do not include any explanatory text, only the JSON
             `;
 
@@ -190,12 +170,8 @@ class GeminiService {
                 }
             };
 
-            console.log('Sending request to Gemini API with retry mechanism...');
-            
-            const result = await this.withRetry(async () => {
-                return await this.model.generateContent([prompt, imagePart]);
-            }, 'Student Answer Extraction');
-
+            console.log('Sending request to Gemini API...');
+            const result = await this.model.generateContent([prompt, imagePart]);
             const response = await result.response;
             let text = response.text();
 
@@ -277,12 +253,8 @@ class GeminiService {
                 }
             };
 
-            console.log('Sending request to Gemini API with retry mechanism...');
-            
-            const result = await this.withRetry(async () => {
-                return await this.model.generateContent([prompt, imagePart]);
-            }, 'Question Paper Extraction (Buffer)');
-
+            console.log('Sending request to Gemini API...');
+            const result = await this.model.generateContent([prompt, imagePart]);
             const response = await result.response;
             let text = response.text();
 
@@ -291,7 +263,7 @@ class GeminiService {
 
             try {
                 const parsedData = JSON.parse(text);
-                console.log(`✓ Successfully extracted ${parsedData.questions.length} questions from buffer`);
+                console.log(`✓ Successfully extracted ${parsedData.questions.length} questions`);
                 
                 return {
                     success: true,
@@ -306,7 +278,7 @@ class GeminiService {
             }
 
         } catch (error) {
-            console.error('Error extracting question paper from buffer:', error);
+            console.error('Error extracting question paper:', error);
             return {
                 success: false,
                 error: error.message,
@@ -330,7 +302,6 @@ class GeminiService {
             - Circles around options
             - Filled bubbles or checkboxes
             - Any other markings that indicate a selected answer
-            - MULTIPLE selections for the same question (students may mark multiple options)
             
             Return ONLY valid JSON with this exact structure:
             {
@@ -338,13 +309,11 @@ class GeminiService {
                 {
                   "question": 1,
                   "selectedOption": "a",
-                  "selectedOptions": ["a"],
                   "confidence": "high"
                 },
                 {
                   "question": 2,
-                  "selectedOption": "b",
-                  "selectedOptions": ["b", "c"], 
+                  "selectedOption": "b", 
                   "confidence": "medium"
                 }
               ]
@@ -353,10 +322,7 @@ class GeminiService {
             Rules:
             - Only include questions where you can clearly see a marked answer
             - Use confidence levels: "high", "medium", "low" based on how clear the marking is
-            - selectedOption should be the first/primary selected option (lowercase a, b, c, d)
-            - selectedOptions should be an array of ALL marked options for that question
-            - If only one option is marked, selectedOptions should be ["a"] (single item array)
-            - If multiple options are marked, include all of them: ["a", "c", "d"]
+            - selectedOption should be lowercase (a, b, c, d)
             - Do not include any explanatory text, only the JSON
             `;
 
@@ -367,12 +333,8 @@ class GeminiService {
                 }
             };
 
-            console.log('Sending request to Gemini API with retry mechanism...');
-            
-            const result = await this.withRetry(async () => {
-                return await this.model.generateContent([prompt, imagePart]);
-            }, 'Student Answer Extraction (Buffer)');
-
+            console.log('Sending request to Gemini API...');
+            const result = await this.model.generateContent([prompt, imagePart]);
             const response = await result.response;
             let text = response.text();
 
@@ -381,7 +343,7 @@ class GeminiService {
 
             try {
                 const parsedData = JSON.parse(text);
-                console.log(`✓ Successfully extracted ${parsedData.answers.length} marked answers from buffer`);
+                console.log(`✓ Successfully extracted ${parsedData.answers.length} marked answers`);
                 
                 return {
                     success: true,
@@ -396,7 +358,7 @@ class GeminiService {
             }
 
         } catch (error) {
-            console.error('Error extracting student answers from buffer:', error);
+            console.error('Error extracting student answers:', error);
             return {
                 success: false,
                 error: error.message,

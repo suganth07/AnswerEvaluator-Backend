@@ -155,6 +155,7 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
             number: q.number,
             text: q.text,
             correctAnswer: q.correctAnswer,
+            correctAnswers: q.correctAnswers || (q.correctAnswer && q.correctAnswer !== 'unknown' ? [q.correctAnswer] : []), // Handle multiple correct answers
             options: q.options, // Always use the real extracted options from Gemini
             questionFormat: 'multiple_choice',
             blankPositions: null,
@@ -231,13 +232,14 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
       
       await pool.query(
         `INSERT INTO questions 
-         (paper_id, question_number, question_text, correct_option, page_number, question_type, options, question_format, blank_positions, points_per_blank) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+         (paper_id, question_number, question_text, correct_option, correct_options, page_number, question_type, options, question_format, blank_positions, points_per_blank) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           paper.id, 
           question.number, 
           question.text, 
-          question.correctAnswer ? question.correctAnswer.toUpperCase() : null, // Convert to uppercase
+          question.correctAnswer && question.correctAnswer !== 'unknown' ? question.correctAnswer.toUpperCase() : null, // Single answer (for backward compatibility)
+          question.correctAnswers && question.correctAnswers.length > 0 ? JSON.stringify(question.correctAnswers.map(a => a.toUpperCase())) : null, // Multiple answers in JSON format
           question.page, 
           question.questionType,
           JSON.stringify(options),

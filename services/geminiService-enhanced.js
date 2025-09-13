@@ -153,7 +153,6 @@ class GeminiService {
             - Circles around options
             - Filled bubbles or checkboxes
             - Any other markings that indicate a selected answer
-            - MULTIPLE selections for the same question (students may mark multiple options)
             
             Return ONLY valid JSON with this exact structure:
             {
@@ -161,13 +160,11 @@ class GeminiService {
                 {
                   "question": 1,
                   "selectedOption": "a",
-                  "selectedOptions": ["a"],
                   "confidence": "high"
                 },
                 {
                   "question": 2,
-                  "selectedOption": "b",
-                  "selectedOptions": ["b", "c"], 
+                  "selectedOption": "b", 
                   "confidence": "medium"
                 }
               ]
@@ -176,10 +173,7 @@ class GeminiService {
             Rules:
             - Only include questions where you can clearly see a marked answer
             - Use confidence levels: "high", "medium", "low" based on how clear the marking is
-            - selectedOption should be the first/primary selected option (lowercase a, b, c, d)
-            - selectedOptions should be an array of ALL marked options for that question
-            - If only one option is marked, selectedOptions should be ["a"] (single item array)
-            - If multiple options are marked, include all of them: ["a", "c", "d"]
+            - selectedOption should be lowercase (a, b, c, d)
             - Do not include any explanatory text, only the JSON
             `;
 
@@ -330,7 +324,6 @@ class GeminiService {
             - Circles around options
             - Filled bubbles or checkboxes
             - Any other markings that indicate a selected answer
-            - MULTIPLE selections for the same question (students may mark multiple options)
             
             Return ONLY valid JSON with this exact structure:
             {
@@ -338,13 +331,11 @@ class GeminiService {
                 {
                   "question": 1,
                   "selectedOption": "a",
-                  "selectedOptions": ["a"],
                   "confidence": "high"
                 },
                 {
                   "question": 2,
-                  "selectedOption": "b",
-                  "selectedOptions": ["b", "c"], 
+                  "selectedOption": "b", 
                   "confidence": "medium"
                 }
               ]
@@ -353,10 +344,7 @@ class GeminiService {
             Rules:
             - Only include questions where you can clearly see a marked answer
             - Use confidence levels: "high", "medium", "low" based on how clear the marking is
-            - selectedOption should be the first/primary selected option (lowercase a, b, c, d)
-            - selectedOptions should be an array of ALL marked options for that question
-            - If only one option is marked, selectedOptions should be ["a"] (single item array)
-            - If multiple options are marked, include all of them: ["a", "c", "d"]
+            - selectedOption should be lowercase (a, b, c, d)
             - Do not include any explanatory text, only the JSON
             `;
 
