@@ -32,14 +32,55 @@ const upload = multer({
   }
 });
 
-// Function to evaluate student answers against correct answers
-const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multiple_choice') => {
+// Function to evaluate student answers against correct answers (enhanced for multiple correct answers)
+const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multiple_choice', evaluationMethod = 'traditional') => {
   if (questionFormat === 'fill_blanks') {
     // Use fill-blanks specific evaluation
     return fillBlanksService.evaluateFillBlanks(correctAnswers, studentAnswers);
   }
 
-  // Traditional multiple choice evaluation
+  // For OMR detection, use the enhanced OMR evaluation
+  if (evaluationMethod === 'omr_detection') {
+    try {
+      // Prepare questions for OMR evaluation
+      const omrQuestions = correctAnswers.map(q => ({
+        question_number: q.question_number,
+        correct_option: q.correct_option,
+        correct_options: q.correct_options ? JSON.parse(q.correct_options) : null
+      }));
+
+      // Convert student answers to OMR format
+      const omrStudentAnswers = studentAnswers.map(a => ({
+        question: a.question,
+        selected_options: a.selectedOptions || (a.selectedOption ? [a.selectedOption] : []),
+        confidence: a.confidence || 'medium',
+        marking_type: a.marking_type || 'unknown'
+      }));
+
+      // Use OMR service evaluation
+      const omrEvaluation = omrService.evaluateOMRAnswers(omrStudentAnswers, omrQuestions);
+      
+      // Convert to expected format
+      return {
+        score: omrEvaluation.summary.total_score,
+        totalQuestions: omrEvaluation.summary.total_questions,
+        percentage: omrEvaluation.summary.percentage,
+        answerResults: omrEvaluation.results.map(result => ({
+          questionNumber: result.question_number,
+          correctOption: result.correct_answers.join(','),
+          studentOption: result.student_answers.join(','),
+          isCorrect: result.is_correct,
+          partialScore: result.partial_score,
+          details: result.evaluation_details
+        }))
+      };
+    } catch (omrError) {
+      console.error('❌ OMR evaluation failed, falling back to traditional:', omrError.message);
+      // Fall back to traditional evaluation
+    }
+  }
+
+  // Traditional multiple choice evaluation (backward compatibility)
   const totalQuestions = correctAnswers.length;
   let score = 0;
   const answerResults = [];
@@ -47,30 +88,70 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
   // Create a map of correct answers for quick lookup
   const correctAnswerMap = {};
   correctAnswers.forEach(q => {
-    correctAnswerMap[q.question_number] = q.correct_option;
+    // Support both single and multiple correct answers
+    if (q.correct_options && q.correct_options !== null) {
+      try {
+        const correctOptions = JSON.parse(q.correct_options);
+        correctAnswerMap[q.question_number] = Array.isArray(correctOptions) ? correctOptions : [q.correct_option];
+      } catch (e) {
+        correctAnswerMap[q.question_number] = [q.correct_option];
+      }
+    } else {
+      correctAnswerMap[q.question_number] = [q.correct_option];
+    }
   });
 
   // Create a map of student answers for quick lookup
   const studentAnswerMap = {};
   studentAnswers.forEach(a => {
-    // Normalize student option to uppercase to match database format
-    studentAnswerMap[a.question] = a.selectedOption?.toUpperCase() || null; // Gemini format: {question: 1, selectedOption: "a"}
+    // Handle both single and multiple answers
+    if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
+      studentAnswerMap[a.question] = a.selectedOptions.map(opt => opt.toUpperCase());
+    } else {
+      studentAnswerMap[a.question] = a.selectedOption ? [a.selectedOption.toUpperCase()] : [];
+    }
   });
 
   // Evaluate each question
   for (const correctAnswer of correctAnswers) {
     const questionNumber = correctAnswer.question_number;
-    const correctOption = correctAnswer.correct_option?.toUpperCase(); // Ensure correct option is uppercase
-    const studentOption = studentAnswerMap[questionNumber] || null;
+    const correctOptions = correctAnswerMap[questionNumber] || [];
+    const studentOptions = studentAnswerMap[questionNumber] || [];
     
-    const isCorrect = studentOption === correctOption;
-    if (isCorrect) score++;
+    // Calculate if answer is correct based on array comparison
+    let isCorrect = false;
+    let partialScore = 0;
+
+    if (correctOptions.length === 1) {
+      // Single correct answer
+      isCorrect = studentOptions.length === 1 && studentOptions[0] === correctOptions[0].toUpperCase();
+      partialScore = isCorrect ? 1 : 0;
+    } else {
+      // Multiple correct answers - use proportional scoring
+      const correctSet = new Set(correctOptions.map(opt => opt.toUpperCase()));
+      const studentSet = new Set(studentOptions);
+      
+      const correctSelections = [...studentSet].filter(ans => correctSet.has(ans)).length;
+      const incorrectSelections = [...studentSet].filter(ans => !correctSet.has(ans)).length;
+      
+      if (correctSelections === correctOptions.length && incorrectSelections === 0) {
+        isCorrect = true;
+        partialScore = 1;
+      } else if (correctSelections > 0) {
+        partialScore = Math.max(0, (correctSelections - incorrectSelections * 0.5) / correctOptions.length);
+        partialScore = Math.round(partialScore * 100) / 100;
+        isCorrect = partialScore >= 0.8; // Consider 80%+ as correct
+      }
+    }
+
+    if (isCorrect || partialScore > 0) score += partialScore;
 
     answerResults.push({
       questionNumber,
-      correctOption,
-      studentOption,
-      isCorrect
+      correctOption: correctOptions.join(','),
+      studentOption: studentOptions.join(','),
+      isCorrect,
+      partialScore
     });
   }
 
@@ -207,10 +288,16 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       try {
         const omrResult = await omrService.detectOMRAnswers(file.buffer, questions);
         if (omrResult && omrResult.detected_answers && omrResult.detected_answers.length > 0) {
-          // Convert OMR format to standard format
+          // Convert new OMR format to standard format
           studentAnswers = omrResult.detected_answers.map(answer => ({
             question: answer.question,
-            selectedOption: answer.selected_option?.toUpperCase() || null
+            // Handle both old (selected_option) and new (selected_options) formats
+            selectedOption: answer.selected_options ? answer.selected_options.join(',').toUpperCase() : 
+                           (answer.selected_option ? answer.selected_option.toUpperCase() : null),
+            selectedOptions: answer.selected_options ? answer.selected_options.map(opt => opt.toUpperCase()) : 
+                            (answer.selected_option ? [answer.selected_option.toUpperCase()] : []),
+            confidence: answer.confidence,
+            marking_type: answer.marking_type
           }));
           geminiResult = { success: true, answers: studentAnswers };
           evaluationMethod = 'omr_detection';
@@ -244,9 +331,9 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       });
     }
 
-    // Get correct answers from database
+    // Get correct answers from database (including multiple correct answers support)
     const correctAnswersResult = await pool.query(
-      'SELECT question_number, correct_option, question_format, blank_positions FROM questions WHERE paper_id = $1 ORDER BY question_number',
+      'SELECT question_number, correct_option, correct_options, question_format, blank_positions FROM questions WHERE paper_id = $1 ORDER BY question_number',
       [paperId]
     );
 
@@ -264,7 +351,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
     const hasFillBlanksQuestions = questionFormats.includes('fill_blanks');
     const primaryFormat = hasFillBlanksQuestions ? 'fill_blanks' : 'multiple_choice';
     
-    const evaluation = evaluateAnswers(correctAnswers, studentAnswers, primaryFormat);
+    const evaluation = evaluateAnswers(correctAnswers, studentAnswers, primaryFormat, evaluationMethod);
 
     // Step 4: Rename the temporary file with score information
     console.log('🏷️ Step 4: Renaming file with score information...');

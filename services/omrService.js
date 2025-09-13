@@ -4,7 +4,7 @@ const fs = require('fs');
 class OMRService {
     constructor() {
         this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        this.model = this.genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        this.model = this.genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     }
 
     /**
@@ -25,13 +25,27 @@ class OMRService {
             Analyze this OMR (Optical Mark Recognition) answer sheet image.
             
             This answer sheet contains questions numbered from 1 to ${maxQuestion}.
-            Each question has multiple choice options (A, B, C, D).
+            Each question has multiple choice options (A, B, C, D, E).
             
-            Instructions:
-            1. Look for FILLED/SHADED circles or bubbles
-            2. Ignore empty, lightly marked, or unclear circles
-            3. For each question, identify which option (A, B, C, D) has the filled circle
-            4. Only report answers where you are confident about the selection
+            CRITICAL DETECTION INSTRUCTIONS:
+            1. Look for ANY type of marking that indicates selection:
+               - FILLED/SHADED circles or bubbles
+               - Checkmarks ✓ or crosses ✗ 
+               - Marks ABOVE the option letters (A, B, C, D, E)
+               - Marks to the RIGHT of option letters
+               - Underlined option letters
+               - Any clear intentional marking
+            
+            2. MULTIPLE ANSWERS PER QUESTION ARE ALLOWED:
+               - Some questions may have multiple correct options selected
+               - Report ALL selected options for each question
+               - Example: Question 2 might have both A and C selected
+            
+            3. Detection criteria:
+               - Look carefully for subtle marks, not just filled circles
+               - Check above, below, left, and right of each option letter
+               - Consider any intentional marking as a selection
+               - Be thorough but accurate
             
             Expected questions: ${questionNumbers.join(', ')}
             
@@ -40,8 +54,15 @@ class OMRService {
               "detected_answers": [
                 {
                   "question": 1,
-                  "selected_option": "A",
-                  "confidence": "high"
+                  "selected_options": ["A"],
+                  "confidence": "high",
+                  "marking_type": "filled_circle"
+                },
+                {
+                  "question": 2,
+                  "selected_options": ["A", "C"],
+                  "confidence": "high",
+                  "marking_type": "marks_above"
                 }
               ],
               "total_questions_found": 0,
@@ -49,11 +70,13 @@ class OMRService {
               "processing_notes": "any observations about detection"
             }
             
-            IMPORTANT:
-            - Only include answers where the circle is clearly and intentionally filled
+            IMPORTANT RULES:
+            - selected_options is ALWAYS an array, even for single answers
+            - Include ALL selected options for each question
+            - Use marking_type to describe how answers were marked: "filled_circle", "checkmark", "marks_above", "marks_right", "underlined", "other"
             - Use confidence levels: "high", "medium", "low"
-            - If a question has no clear selection or multiple selections, omit it
-            - Be conservative - it's better to miss an unclear answer than report a wrong one
+            - If no clear selection found for a question, omit it entirely
+            - Be thorough in detecting various marking styles
             `;
 
             const imagePart = {
@@ -87,9 +110,9 @@ class OMRService {
     }
 
     /**
-     * Evaluate OMR answers against correct answers
+     * Evaluate OMR answers against correct answers (supports multiple correct answers)
      * @param {Array} detectedAnswers - Answers detected from OMR
-     * @param {Array} questions - Question objects with correct_option
+     * @param {Array} questions - Question objects with correct_option(s)
      * @returns {Object} Evaluation results
      */
     evaluateOMRAnswers(detectedAnswers, questions) {
@@ -115,19 +138,51 @@ class OMRService {
                 }
 
                 answeredQuestions++;
-                const isCorrect = detected.selected_option?.toUpperCase() === question.correct_option?.toUpperCase();
-                if (isCorrect) {
+
+                // Get correct answers (support both single and multiple correct answers)
+                let correctOptions = [];
+                if (question.correct_option) {
+                    // Single correct answer
+                    correctOptions = [question.correct_option.toUpperCase()];
+                } else if (question.correct_options && Array.isArray(question.correct_options)) {
+                    // Multiple correct answers
+                    correctOptions = question.correct_options.map(opt => opt.toUpperCase());
+                } else {
+                    console.warn(`⚠️ No correct answer defined for question ${detected.question}`);
+                    return;
+                }
+
+                // Get student answers (handle both old and new format)
+                let studentOptions = [];
+                if (detected.selected_options && Array.isArray(detected.selected_options)) {
+                    // New format with multiple options
+                    studentOptions = detected.selected_options.map(opt => opt.toUpperCase());
+                } else if (detected.selected_option) {
+                    // Old format with single option
+                    studentOptions = [detected.selected_option.toUpperCase()];
+                }
+
+                // Calculate score based on matching
+                const { score, isCorrect, details } = this.calculateMultipleChoiceScore(
+                    studentOptions, 
+                    correctOptions
+                );
+
+                if (isCorrect || score > 0) {
                     correctAnswers++;
-                    totalScore += 1; // 1 point per correct answer
+                    totalScore += score;
                 }
 
                 results.push({
                     question_number: detected.question,
-                    student_answer: detected.selected_option?.toUpperCase(),
-                    correct_answer: question.correct_option?.toUpperCase(),
+                    student_answers: studentOptions,
+                    correct_answers: correctOptions,
                     is_correct: isCorrect,
+                    partial_score: score,
+                    max_points: 1,
                     confidence: detected.confidence,
-                    points: isCorrect ? 1 : 0
+                    marking_type: detected.marking_type || 'unknown',
+                    evaluation_details: details
                 });
             });
 
@@ -135,18 +190,28 @@ class OMRService {
             questions.forEach(q => {
                 const wasAnswered = detectedAnswers.some(d => d.question === q.question_number);
                 if (!wasAnswered) {
+                    let correctOptions = [];
+                    if (q.correct_option) {
+                        correctOptions = [q.correct_option.toUpperCase()];
+                    } else if (q.correct_options && Array.isArray(q.correct_options)) {
+                        correctOptions = q.correct_options.map(opt => opt.toUpperCase());
+                    }
+
                     results.push({
                         question_number: q.question_number,
-                        student_answer: null,
-                        correct_answer: q.correct_option,
+                        student_answers: [],
+                        correct_answers: correctOptions,
                         is_correct: false,
+                        partial_score: 0,
+                        max_points: 1,
                         confidence: null,
-                        points: 0
+                        marking_type: 'none',
+                        evaluation_details: 'No answer detected'
                     });
                 }
             });
 
-            const percentage = totalQuestions > 0 ? (correctAnswers / totalQuestions) * 100 : 0;
+            const percentage = totalQuestions > 0 ? (totalScore / totalQuestions) * 100 : 0;
 
             return {
                 results,
@@ -164,6 +229,79 @@ class OMRService {
         } catch (error) {
             console.error('❌ OMR Evaluation failed:', error.message);
             throw error;
+        }
+    }
+
+    /**
+     * Calculate score for multiple choice questions with multiple correct answers
+     * @param {Array} studentAnswers - Array of student selected options
+     * @param {Array} correctAnswers - Array of correct options
+     * @returns {Object} Score calculation result
+     */
+    calculateMultipleChoiceScore(studentAnswers, correctAnswers) {
+        // Handle empty arrays
+        if (studentAnswers.length === 0) {
+            return {
+                score: 0,
+                isCorrect: false,
+                details: 'No answers selected'
+            };
+        }
+
+        if (correctAnswers.length === 0) {
+            return {
+                score: 0,
+                isCorrect: false,
+                details: 'No correct answers defined'
+            };
+        }
+
+        // Convert to sets for easier comparison
+        const studentSet = new Set(studentAnswers);
+        const correctSet = new Set(correctAnswers);
+
+        // Calculate matches
+        const correctSelections = [...studentSet].filter(ans => correctSet.has(ans));
+        const incorrectSelections = [...studentSet].filter(ans => !correctSet.has(ans));
+        const missedSelections = [...correctSet].filter(ans => !studentSet.has(ans));
+
+        // Scoring logic for multiple correct answers
+        if (correctAnswers.length === 1) {
+            // Single correct answer
+            const isExactMatch = correctSelections.length === 1 && incorrectSelections.length === 0;
+            return {
+                score: isExactMatch ? 1 : 0,
+                isCorrect: isExactMatch,
+                details: isExactMatch ? 'Correct' : 
+                        incorrectSelections.length > 0 ? 'Incorrect answer selected' : 'Wrong answer'
+            };
+        } else {
+            // Multiple correct answers - use proportional scoring
+            const totalCorrect = correctAnswers.length;
+            const correctlySelected = correctSelections.length;
+            const incorrectlySelected = incorrectSelections.length;
+
+            // Perfect match gets full score
+            if (correctlySelected === totalCorrect && incorrectlySelected === 0) {
+                return {
+                    score: 1,
+                    isCorrect: true,
+                    details: 'All correct answers selected'
+                };
+            }
+
+            // Partial credit based on correct selections minus penalties for wrong selections
+            let partialScore = 0;
+            if (correctlySelected > 0) {
+                partialScore = Math.max(0, (correctlySelected - incorrectlySelected * 0.5) / totalCorrect);
+                partialScore = Math.round(partialScore * 100) / 100; // Round to 2 decimal places
+            }
+
+            return {
+                score: partialScore,
+                isCorrect: partialScore >= 0.8, // Consider 80%+ as "correct"
+                details: `Partial credit: ${correctlySelected}/${totalCorrect} correct, ${incorrectlySelected} wrong`
+            };
         }
     }
 
@@ -195,24 +333,32 @@ class OMRService {
             const prompt = `
             Analyze this image to determine if it contains OMR (Optical Mark Recognition) style content.
             
-            Look for:
+            Look for ANY of these OMR indicators:
             1. Multiple choice questions with circular bubbles/circles to fill
-            2. Grid-like layout with options A, B, C, D
+            2. Grid-like layout with options A, B, C, D, E
             3. Question numbers arranged in rows
             4. Standardized answer sheet format
+            5. Answer markings that could be:
+               - Filled/shaded circles
+               - Checkmarks above or beside options
+               - Marks to the right of option letters
+               - Any systematic marking pattern for multiple choice
             
-            vs Traditional format:
-            1. Written text answers
-            2. Checkboxes instead of circles
-            3. Free-form text responses
-            4. Mathematical equations or diagrams
+            vs Non-OMR formats:
+            1. Written text answers or essays
+            2. Fill-in-the-blank questions with lines
+            3. Mathematical equations to solve
+            4. Diagram-based questions
+            5. Free-form response areas
             
             Return JSON:
             {
               "is_omr_style": true/false,
               "confidence": "high/medium/low",
-              "detected_features": ["circles", "grid_layout", "multiple_choice"],
-              "question_type": "omr/traditional/mixed"
+              "detected_features": ["circles", "grid_layout", "multiple_choice", "systematic_marking"],
+              "question_type": "omr/traditional/mixed",
+              "marking_patterns": ["filled_circles", "checkmarks", "marks_above", "marks_right"],
+              "estimated_questions": 5
             }
             `;
 
@@ -237,7 +383,9 @@ class OMRService {
                     is_omr_style: false,
                     confidence: "low",
                     detected_features: [],
-                    question_type: "traditional"
+                    question_type: "traditional",
+                    marking_patterns: [],
+                    estimated_questions: 0
                 };
             }
 
@@ -247,7 +395,9 @@ class OMRService {
                 is_omr_style: false,
                 confidence: "low",
                 detected_features: [],
-                question_type: "traditional"
+                question_type: "traditional",
+                marking_patterns: [],
+                estimated_questions: 0
             };
         }
     }
