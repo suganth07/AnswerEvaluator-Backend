@@ -291,11 +291,14 @@ router.post('/submit', uploadAnswer, async (req, res) => {
           // Convert new OMR format to standard format
           studentAnswers = omrResult.detected_answers.map(answer => ({
             question: answer.question,
-            // Handle both old (selected_option) and new (selected_options) formats
-            selectedOption: answer.selected_options ? answer.selected_options.join(',').toUpperCase() : 
-                           (answer.selected_option ? answer.selected_option.toUpperCase() : null),
+            // Keep selectedOptions as the primary field for multiple selections
             selectedOptions: answer.selected_options ? answer.selected_options.map(opt => opt.toUpperCase()) : 
                             (answer.selected_option ? [answer.selected_option.toUpperCase()] : []),
+            // Keep selectedOption for backward compatibility (use first option or comma-separated string)
+            selectedOption: answer.selected_options && answer.selected_options.length > 0 ? 
+                           (answer.selected_options.length === 1 ? answer.selected_options[0].toUpperCase() : 
+                            answer.selected_options.map(opt => opt.toUpperCase()).join(',')) :
+                           (answer.selected_option ? answer.selected_option.toUpperCase() : null),
             confidence: answer.confidence,
             marking_type: answer.marking_type
           }));
@@ -397,10 +400,40 @@ router.post('/submit', uploadAnswer, async (req, res) => {
     } else {
       // Handle multiple choice answers
       for (const answerResult of evaluation.answerResults) {
+        const studentAnswer = studentAnswers.find(a => a.question === answerResult.questionNumber);
+        
+        // Prepare selected options for storage
+        let selectedOptionsForDB = null;
+        let selectedOptionForDB = null;
+        
+        if (studentAnswer && studentAnswer.selectedOptions && studentAnswer.selectedOptions.length > 0) {
+          // Store multiple selections as JSONB array
+          selectedOptionsForDB = JSON.stringify(studentAnswer.selectedOptions);
+          // Store primary selection for backward compatibility
+          selectedOptionForDB = studentAnswer.selectedOptions.length === 1 ? 
+                                studentAnswer.selectedOptions[0] : 
+                                studentAnswer.selectedOptions.join(',');
+        } else {
+          // Fallback to answerResult data
+          selectedOptionForDB = answerResult.studentOption?.toUpperCase() || null;
+          if (selectedOptionForDB && selectedOptionForDB.includes(',')) {
+            // Convert comma-separated string back to array
+            selectedOptionsForDB = JSON.stringify(selectedOptionForDB.split(','));
+          } else if (selectedOptionForDB) {
+            selectedOptionsForDB = JSON.stringify([selectedOptionForDB]);
+          }
+        }
+
         await pool.query(`
-          INSERT INTO student_answers (submission_id, question_number, selected_option, is_correct) 
-          VALUES ($1, $2, $3, $4)
-        `, [submission.id, answerResult.questionNumber, answerResult.studentOption?.toUpperCase() || null, answerResult.isCorrect]);
+          INSERT INTO student_answers (submission_id, question_number, selected_option, selected_options, is_correct) 
+          VALUES ($1, $2, $3, $4, $5)
+        `, [
+          submission.id, 
+          answerResult.questionNumber, 
+          selectedOptionForDB, 
+          selectedOptionsForDB,
+          answerResult.isCorrect
+        ]);
       }
     }
 

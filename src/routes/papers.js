@@ -155,7 +155,7 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
             number: q.number,
             text: q.text,
             correctAnswer: q.correctAnswer,
-            options: pageQuestionType === 'omr' ? ['A', 'B', 'C', 'D'] : q.options,
+            options: q.options, // Always use the real extracted options from Gemini
             questionFormat: 'multiple_choice',
             blankPositions: null,
             totalPoints: 1
@@ -218,7 +218,15 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
       // Set options based on question format
       let options = null;
       if (question.questionFormat === 'multiple_choice') {
-        options = question.questionType === 'omr' ? ['A', 'B', 'C', 'D'] : question.options;
+        // Use the real extracted options from Gemini, converting to uppercase keys
+        if (question.options && typeof question.options === 'object') {
+          // Convert lowercase keys (a, b, c, d) to uppercase (A, B, C, D) while preserving the real text
+          options = {};
+          Object.entries(question.options).forEach(([key, value]) => {
+            const upperKey = key.toUpperCase();
+            options[upperKey] = value; // Keep the real extracted option text
+          });
+        }
       }
       
       await pool.query(
@@ -229,7 +237,7 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
           paper.id, 
           question.number, 
           question.text, 
-          question.correctAnswer, 
+          question.correctAnswer ? question.correctAnswer.toUpperCase() : null, // Convert to uppercase
           question.page, 
           question.questionType,
           JSON.stringify(options),
