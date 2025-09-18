@@ -230,6 +230,25 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
         }
       }
       
+      // Determine correct answers - ensure constraint compliance
+      let correctOption = null;
+      let correctOptions = null;
+
+      if (question.correctAnswer && question.correctAnswer !== 'unknown') {
+        correctOption = question.correctAnswer.toUpperCase();
+      }
+
+      if (question.correctAnswers && Array.isArray(question.correctAnswers) && question.correctAnswers.length > 0) {
+        correctOptions = JSON.stringify(question.correctAnswers.map(a => a.toUpperCase()));
+      }
+
+      // Ensure constraint compliance: at least one correct answer field must be valid
+      if (!correctOption && !correctOptions) {
+        // Default to first option 'A' if no correct answer is detected
+        console.warn(`No correct answer detected for question ${question.number}, defaulting to 'A'`);
+        correctOption = 'A';
+      }
+      
       await pool.query(
         `INSERT INTO questions 
          (paper_id, question_number, question_text, correct_option, correct_options, page_number, question_type, options, question_format, blank_positions, points_per_blank) 
@@ -238,8 +257,8 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
           paper.id, 
           question.number, 
           question.text, 
-          question.correctAnswer && question.correctAnswer !== 'unknown' ? question.correctAnswer.toUpperCase() : null, // Single answer (for backward compatibility)
-          question.correctAnswers && question.correctAnswers.length > 0 ? JSON.stringify(question.correctAnswers.map(a => a.toUpperCase())) : null, // Multiple answers in JSON format
+          correctOption, // Single answer (for backward compatibility)
+          correctOptions, // Multiple answers in JSON format
           question.page, 
           question.questionType,
           JSON.stringify(options),

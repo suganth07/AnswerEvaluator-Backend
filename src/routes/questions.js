@@ -44,6 +44,12 @@ router.get("/paper/:paperId", verifyToken, async (req, res) => {
     const paper = paperResult.rows[0];
     const questions = questionsResult.rows;
 
+    // Debug: log what we're returning
+    console.log(`📊 Returning ${questions.length} questions for paper ${paperId}:`);
+    questions.forEach(q => {
+      console.log(`  Q${q.question_number}: format=${q.question_format}, correct_option="${q.correct_option}", correct_options=${JSON.stringify(q.correct_options)}`);
+    });
+
     res.json({
       paper: paper,
       questions: questions,

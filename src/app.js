@@ -14,6 +14,7 @@ app.use("/api/auth", require("./routes/auth"));
 app.use("/api/papers", require("./routes/papers"));
 app.use("/api/submissions", require("./routes/submissions"));
 app.use("/api/questions", require("./routes/questions"));
+app.use("/api/manual-tests", require("./routes/manual-tests"));
 
 // Health check endpoint
 app.get("/health", (req, res) => {
