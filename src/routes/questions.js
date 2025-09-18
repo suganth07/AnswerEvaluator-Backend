@@ -1,5 +1,5 @@
 const express = require("express");
-const pool = require("../db");
+const prisma = require("../prisma");
 
 const router = express.Router();
 
@@ -24,36 +24,53 @@ const verifyToken = (req, res, next) => {
 // Get all questions for a specific paper
 router.get("/paper/:paperId", verifyToken, async (req, res) => {
   try {
-    const paperId = req.params.paperId;
+    const paperId = parseInt(req.params.paperId);
 
-    // Verify paper exists
-    const paperResult = await pool.query(
-      "SELECT id, name FROM papers WHERE id = $1",
-      [paperId]
-    );
-    if (paperResult.rows.length === 0) {
+    // Verify paper exists and get questions
+    const paper = await prisma.paper.findUnique({
+      where: { id: paperId },
+      include: {
+        questions: {
+          orderBy: { questionNumber: 'asc' }
+        }
+      }
+    });
+
+    if (!paper) {
       return res.status(404).json({ error: "Paper not found" });
     }
 
-    // Get questions for this paper
-    const questionsResult = await pool.query(
-      "SELECT * FROM questions WHERE paper_id = $1 ORDER BY question_number",
-      [paperId]
-    );
+    const questions = paper.questions;
 
-    const paper = paperResult.rows[0];
-    const questions = questionsResult.rows;
+    // Transform questions to ensure frontend compatibility
+    const transformedQuestions = questions.map(q => ({
+      ...q,
+      // Add backward compatibility fields
+      correct_option: q.correctOptions && q.correctOptions.length > 0 && q.options 
+        ? q.options[q.correctOptions[0]] || q.correctOptions[0] 
+        : null,
+      correct_options: q.correctOptions,
+      // Ensure proper field naming for frontend
+      question_number: q.questionNumber,
+      question_text: q.questionText,
+      page_number: q.pageNumber,
+      question_type: q.questionType,
+      question_format: q.questionFormat,
+      points_per_blank: q.pointsPerBlank,
+      blank_positions: q.blankPositions,
+      expected_answers: q.expectedAnswers
+    }));
 
     // Debug: log what we're returning
-    console.log(`📊 Returning ${questions.length} questions for paper ${paperId}:`);
-    questions.forEach(q => {
+    console.log(`📊 Returning ${transformedQuestions.length} questions for paper ${paperId}:`);
+    transformedQuestions.forEach(q => {
       console.log(`  Q${q.question_number}: format=${q.question_format}, correct_option="${q.correct_option}", correct_options=${JSON.stringify(q.correct_options)}`);
     });
 
     res.json({
-      paper: paper,
-      questions: questions,
-      totalQuestions: questions.length,
+      paper: { id: paper.id, name: paper.name },
+      questions: transformedQuestions,
+      totalQuestions: transformedQuestions.length,
     });
   } catch (error) {
     console.error("Error fetching questions:", error);
@@ -64,17 +81,34 @@ router.get("/paper/:paperId", verifyToken, async (req, res) => {
 // Get a specific question by ID
 router.get("/:id", verifyToken, async (req, res) => {
   try {
-    const questionId = req.params.id;
+    const questionId = parseInt(req.params.id);
 
-    const result = await pool.query("SELECT * FROM questions WHERE id = $1", [
-      questionId,
-    ]);
+    const question = await prisma.question.findUnique({
+      where: { id: questionId }
+    });
 
-    if (result.rows.length === 0) {
+    if (!question) {
       return res.status(404).json({ error: "Question not found" });
     }
 
-    res.json(result.rows[0]);
+    // Transform question for frontend compatibility
+    const transformedQuestion = {
+      ...question,
+      correct_option: question.correctOptions && question.correctOptions.length > 0 && question.options 
+        ? question.options[question.correctOptions[0]] || question.correctOptions[0] 
+        : null,
+      correct_options: question.correctOptions,
+      question_number: question.questionNumber,
+      question_text: question.questionText,
+      page_number: question.pageNumber,
+      question_type: question.questionType,
+      question_format: question.questionFormat,
+      points_per_blank: question.pointsPerBlank,
+      blank_positions: question.blankPositions,
+      expected_answers: question.expectedAnswers
+    };
+
+    res.json(transformedQuestion);
   } catch (error) {
     console.error("Error fetching question:", error);
     res.status(500).json({ error: "Failed to fetch question" });
@@ -88,70 +122,94 @@ router.post("/", verifyToken, async (req, res) => {
       paper_id,
       question_number,
       question_text,
-      correct_option,
-      correct_options, // Support for multiple correct answers
+      correct_options, // Only use correct_options array
+      correct_option, // Also accept correct_option for single-answer mode
       page_number = 1,
       question_type = "traditional",
       options,
+      weightages, // Add weightages support
+      points_per_blank = 1, // Add points support
     } = req.body;
 
-    // Validate required fields - either correct_option or correct_options must be provided
-    if (!paper_id || !question_number || (!correct_option && !correct_options)) {
+    // Validate required fields
+    if (!paper_id || !question_number) {
       return res.status(400).json({
-        error:
-          "Missing required fields: paper_id, question_number, and either correct_option or correct_options",
+        error: "Missing required fields: paper_id and question_number",
       });
     }
 
-    // Validate correct_options if provided
-    if (correct_options && (!Array.isArray(correct_options) || correct_options.length === 0)) {
+    // Validate correct_options OR correct_option
+    if (!correct_options && !correct_option) {
       return res.status(400).json({
-        error: "correct_options must be a non-empty array",
+        error: "Either correct_options (array) or correct_option (string) is required",
       });
+    }
+
+    // If correct_options is provided, validate it
+    if (correct_options) {
+      if (!Array.isArray(correct_options) || correct_options.length === 0) {
+        return res.status(400).json({
+          error: "correct_options must be a non-empty array",
+        });
+      }
     }
 
     // Verify paper exists
-    const paperResult = await pool.query(
-      "SELECT id FROM papers WHERE id = $1",
-      [paper_id]
-    );
-    if (paperResult.rows.length === 0) {
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(paper_id) }
+    });
+    
+    if (!paper) {
       return res.status(404).json({ error: "Paper not found" });
     }
 
     // Check if question number already exists for this paper
-    const existingQuestion = await pool.query(
-      "SELECT id FROM questions WHERE paper_id = $1 AND question_number = $2",
-      [paper_id, question_number]
-    );
+    const existingQuestion = await prisma.question.findFirst({
+      where: {
+        paperId: parseInt(paper_id),
+        questionNumber: question_number
+      }
+    });
 
-    if (existingQuestion.rows.length > 0) {
+    if (existingQuestion) {
       return res.status(400).json({
         error: `Question number ${question_number} already exists for this paper`,
       });
     }
 
-    // Insert new question with support for multiple correct answers
-    const result = await pool.query(
-      `INSERT INTO questions 
-       (paper_id, question_number, question_text, correct_option, correct_options, page_number, question_type, options) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
-       RETURNING *`,
-      [
-        paper_id,
-        question_number,
-        question_text,
-        correct_option,
-        correct_options ? JSON.stringify(correct_options) : null,
-        page_number,
-        question_type,
-        options,
-      ]
-    );
+    // Insert new question
+    const question = await prisma.question.create({
+      data: {
+        paperId: parseInt(paper_id),
+        questionNumber: question_number,
+        questionText: question_text,
+        correctOptions: correct_options || (correct_option ? [correct_option] : []),
+        pageNumber: page_number,
+        questionType: question_type,
+        options: options || undefined,
+        weightages: weightages || undefined,
+        pointsPerBlank: points_per_blank
+      }
+    });
+
+    // Transform response for frontend compatibility
+    const transformedQuestion = {
+      ...question,
+      correct_option: question.correctOptions && question.correctOptions.length > 0 && question.options 
+        ? question.options[question.correctOptions[0]] || question.correctOptions[0] 
+        : null,
+      correct_options: question.correctOptions,
+      question_number: question.questionNumber,
+      question_text: question.questionText,
+      page_number: question.pageNumber,
+      question_type: question.questionType,
+      question_format: question.questionFormat,
+      points_per_blank: question.pointsPerBlank
+    };
 
     res.status(201).json({
       message: "Question created successfully",
-      question: result.rows[0],
+      question: transformedQuestion,
     });
   } catch (error) {
     console.error("Error creating question:", error);
@@ -162,39 +220,52 @@ router.post("/", verifyToken, async (req, res) => {
 // Update a question
 router.put("/:id", verifyToken, async (req, res) => {
   try {
-    const questionId = req.params.id;
+    const questionId = parseInt(req.params.id);
     const {
       question_number,
       question_text,
-      correct_option,
-      correct_options, // Support for multiple correct answers
+      correct_options, // Only use correct_options array
+      correct_option, // Also accept correct_option for single-answer mode
       page_number,
       question_type,
       options,
+      weightages, // Add weightages support
+      points_per_blank, // Add points support
     } = req.body;
 
+    // Debug logging to see what data we're receiving
+    console.log(`📝 Updating question ${questionId} with data:`, {
+      question_number,
+      question_text: question_text ? question_text.substring(0, 50) + '...' : question_text,
+      correct_options,
+      correct_option,
+      page_number,
+      question_type,
+      options,
+      weightages,
+      points_per_blank
+    });
+
     // Check if question exists
-    const existingQuestion = await pool.query(
-      "SELECT * FROM questions WHERE id = $1",
-      [questionId]
-    );
-    if (existingQuestion.rows.length === 0) {
+    const existingQuestion = await prisma.question.findUnique({
+      where: { id: questionId }
+    });
+    
+    if (!existingQuestion) {
       return res.status(404).json({ error: "Question not found" });
     }
 
-    const currentQuestion = existingQuestion.rows[0];
-
     // If question_number is being changed, check for duplicates
-    if (
-      question_number &&
-      question_number !== currentQuestion.question_number
-    ) {
-      const duplicateCheck = await pool.query(
-        "SELECT id FROM questions WHERE paper_id = $1 AND question_number = $2 AND id != $3",
-        [currentQuestion.paper_id, question_number, questionId]
-      );
+    if (question_number && question_number !== existingQuestion.questionNumber) {
+      const duplicateCheck = await prisma.question.findFirst({
+        where: {
+          paperId: existingQuestion.paperId,
+          questionNumber: question_number,
+          id: { not: questionId }
+        }
+      });
 
-      if (duplicateCheck.rows.length > 0) {
+      if (duplicateCheck) {
         return res.status(400).json({
           error: `Question number ${question_number} already exists for this paper`,
         });
@@ -203,61 +274,54 @@ router.put("/:id", verifyToken, async (req, res) => {
 
     // Validate correct_options if provided
     if (correct_options !== undefined && correct_options !== null) {
-      if (!Array.isArray(correct_options) || correct_options.length === 0) {
+      if (!Array.isArray(correct_options)) {
         return res.status(400).json({
-          error: "correct_options must be a non-empty array",
+          error: "correct_options must be an array",
         });
       }
+      // Allow empty array for clearing correct options
     }
 
-    // Build update query dynamically
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
+    // Build update data object
+    const updateData = {};
+    if (question_number !== undefined) updateData.questionNumber = question_number;
+    if (question_text !== undefined) updateData.questionText = question_text;
+    if (correct_options !== undefined) updateData.correctOptions = correct_options;
+    if (page_number !== undefined) updateData.pageNumber = page_number;
+    if (question_type !== undefined) updateData.questionType = question_type;
+    if (options !== undefined) updateData.options = options;
+    if (weightages !== undefined) updateData.weightages = weightages;
+    if (points_per_blank !== undefined) updateData.pointsPerBlank = points_per_blank;
 
-    if (question_number !== undefined) {
-      updates.push(`question_number = $${paramCount++}`);
-      values.push(question_number);
-    }
-    if (question_text !== undefined) {
-      updates.push(`question_text = $${paramCount++}`);
-      values.push(question_text);
-    }
-    if (correct_option !== undefined) {
-      updates.push(`correct_option = $${paramCount++}`);
-      values.push(correct_option);
-    }
-    if (correct_options !== undefined) {
-      updates.push(`correct_options = $${paramCount++}`);
-      values.push(correct_options ? JSON.stringify(correct_options) : null);
-    }
-    if (page_number !== undefined) {
-      updates.push(`page_number = $${paramCount++}`);
-      values.push(page_number);
-    }
-    if (question_type !== undefined) {
-      updates.push(`question_type = $${paramCount++}`);
-      values.push(question_type);
-    }
-    if (options !== undefined) {
-      updates.push(`options = $${paramCount++}`);
-      values.push(options);
-    }
+    console.log(`📊 Final update data for question ${questionId}:`, updateData);
 
-    if (updates.length === 0) {
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: "No fields to update" });
     }
 
-    values.push(questionId);
-    const query = `UPDATE questions SET ${updates.join(
-      ", "
-    )} WHERE id = $${paramCount} RETURNING *`;
+    const question = await prisma.question.update({
+      where: { id: questionId },
+      data: updateData
+    });
 
-    const result = await pool.query(query, values);
+    // Transform response for frontend compatibility
+    const transformedQuestion = {
+      ...question,
+      correct_option: question.correctOptions && question.correctOptions.length > 0 && question.options 
+        ? question.options[question.correctOptions[0]] || question.correctOptions[0] 
+        : null,
+      correct_options: question.correctOptions,
+      question_number: question.questionNumber,
+      question_text: question.questionText,
+      page_number: question.pageNumber,
+      question_type: question.questionType,
+      question_format: question.questionFormat,
+      points_per_blank: question.pointsPerBlank
+    };
 
     res.json({
       message: "Question updated successfully",
-      question: result.rows[0],
+      question: transformedQuestion,
     });
   } catch (error) {
     console.error("Error updating question:", error);
@@ -268,22 +332,21 @@ router.put("/:id", verifyToken, async (req, res) => {
 // Delete a question
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
-    const questionId = req.params.id;
+    const questionId = parseInt(req.params.id);
 
-    // Get question details before deletion for paper_id
-    const questionResult = await pool.query(
-      "SELECT paper_id FROM questions WHERE id = $1",
-      [questionId]
-    );
+    // Check if question exists
+    const question = await prisma.question.findUnique({
+      where: { id: questionId }
+    });
 
-    if (questionResult.rows.length === 0) {
+    if (!question) {
       return res.status(404).json({ error: "Question not found" });
     }
 
     // Delete the question
-    await pool.query("DELETE FROM questions WHERE id = $1", [questionId]);
-
-    // No need to update question_count as it's calculated dynamically in papers route
+    await prisma.question.delete({
+      where: { id: questionId }
+    });
 
     res.json({ message: "Question deleted successfully" });
   } catch (error) {

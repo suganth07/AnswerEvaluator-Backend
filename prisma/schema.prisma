@@ -1,0 +1,101 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id            Int      @id @default(autoincrement())
+  username      String   @unique @db.VarChar(50)
+  passwordHash  String   @map("password_hash") @db.VarChar(255)
+  createdAt     DateTime @default(now()) @map("created_at")
+  
+  // Relations
+  papers        Paper[]
+  
+  @@map("admins")
+}
+
+model Paper {
+  id              Int      @id @default(autoincrement())
+  name            String   @db.VarChar(100)
+  imageUrl        String?  @map("image_url") @db.Text
+  uploadedAt      DateTime @default(now()) @map("uploaded_at")
+  adminId         Int      @map("admin_id")
+  totalPages      Int      @default(1) @map("total_pages")
+  questionType    String   @default("traditional") @map("question_type") @db.VarChar(20)
+  questionTypes   Json?    @default("{}") @map("question_types")
+  mixedConfig     Json?    @default("{}") @map("mixed_config")
+  
+  // Relations
+  admin           Admin               @relation(fields: [adminId], references: [id])
+  questions       Question[]
+  submissions     StudentSubmission[]
+  
+  @@map("papers")
+}
+
+model Question {
+  id              Int      @id @default(autoincrement())
+  paperId         Int      @map("paper_id")
+  questionNumber  Int      @map("question_number")
+  questionText    String   @map("question_text") @db.Text
+  pageNumber      Int      @default(1) @map("page_number")
+  questionType    String   @default("traditional") @map("question_type") @db.VarChar(20)
+  options         Json?
+  blankPositions  Json?    @map("blank_positions") @default("{}")
+  expectedAnswers Json?    @map("expected_answers") @default("{}")
+  questionFormat  String   @default("multiple_choice") @map("question_format") @db.VarChar(50)
+  pointsPerBlank  Int      @default(1) @map("points_per_blank")
+  correctOptions  Json     @map("correct_options")
+  weightages      Json?
+  
+  // Relations
+  paper           Paper            @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  
+  @@map("questions")
+}
+
+model StudentSubmission {
+  id               Int      @id @default(autoincrement())
+  paperId          Int      @map("paper_id")
+  studentName      String   @map("student_name") @db.VarChar(100)
+  rollNo           String   @map("roll_no") @db.VarChar(20)
+  imageUrl         String   @map("image_url") @db.Text
+  score            Decimal  @default(0) @db.Decimal(5,2)
+  totalQuestions   Int      @default(0) @map("total_questions")
+  percentage       Decimal  @default(0.00) @db.Decimal(5,2)
+  submittedAt      DateTime @default(now()) @map("submitted_at")
+  answerTypes      Json?    @default("{}") @map("answer_types")
+  evaluationMethod String   @default("auto") @map("evaluation_method") @db.VarChar(100)
+  evaluationStatus String   @default("pending") @map("evaluation_status") @db.VarChar(20)
+  
+  // Relations
+  paper            Paper           @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  answers          StudentAnswer[]
+  
+  @@map("student_submissions")
+}
+
+model StudentAnswer {
+  id               Int     @id @default(autoincrement())
+  submissionId     Int     @map("submission_id")
+  questionNumber   Int     @map("question_number")
+  selectedOption   String? @map("selected_option") @db.VarChar(10)
+  isCorrect        Boolean @default(false) @map("is_correct")
+  textAnswer       String? @map("text_answer") @db.Text
+  blankAnswers     Json?   @default("{}") @map("blank_answers")
+  answerType       String  @default("mcq") @map("answer_type") @db.VarChar(20)
+  selectedOptions  Json?   @map("selected_options")
+  
+  // Relations
+  submission       StudentSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  
+  @@map("student_answers")
+}

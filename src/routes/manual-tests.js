@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const pool = require('../db');
+const prisma = require('../prisma');
 
 const router = express.Router();
 
@@ -13,18 +13,18 @@ router.post('/create-manual', async (req, res) => {
       return res.status(400).json({ error: 'Test name and questions are required' });
     }
 
-    // Start transaction
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
+    // Use Prisma transaction
+    const result = await prisma.$transaction(async (tx) => {
       // Insert paper
-      const paperResult = await client.query(`
-        INSERT INTO papers (name, uploaded_at, total_pages, question_type, admin_id) 
-        VALUES ($1, $2, $3, $4, $5) RETURNING id
-      `, [testName, new Date(), 1, 'traditional', 1]);
-
-      const paperId = paperResult.rows[0].id;
+      const paper = await tx.paper.create({
+        data: {
+          name: testName,
+          uploadedAt: new Date(),
+          totalPages: 1,
+          questionType: 'traditional',
+          adminId: 1
+        }
+      });
 
       // Insert questions
       for (let i = 0; i < questions.length; i++) {
@@ -33,7 +33,6 @@ router.post('/create-manual', async (req, res) => {
         console.log(`📝 Processing question ${question.questionNumber}: isMultipleChoice = ${question.isMultipleChoice}, hasOptions = ${question.options ? question.options.length : 0}, singleCorrectAnswer = "${question.singleCorrectAnswer}"`);
         
         // Prepare question data
-        let correctOption = null;
         let correctOptions = [];
         let options = {};
         let weightages = {};
@@ -44,69 +43,64 @@ router.post('/create-manual', async (req, res) => {
             options[opt.id] = opt.text;
             if (opt.isCorrect) {
               correctOptions.push(opt.id);
-              weightages[opt.id] = opt.weight;
+              // Handle weightage - allow 0 and decimal values
+              const weight = parseFloat(opt.weight);
+              if (!isNaN(weight) && weight >= 0) {
+                weightages[opt.id] = weight;
+              } else {
+                // Default to 1 if invalid weight
+                weightages[opt.id] = 1;
+              }
+              console.log(`  Option ${opt.id}: weight = ${opt.weight} → parsed as ${weightages[opt.id]}`);
             }
           });
-
-          // Set correct_option for single correct answer (backward compatibility)
-          if (correctOptions.length === 1) {
-            correctOption = correctOptions[0];
-          } else if (correctOptions.length > 1) {
-            correctOption = correctOptions.join(','); // Multiple options as comma-separated
-          }
         } else {
           // For non-multiple choice questions, use singleCorrectAnswer
-          correctOption = question.singleCorrectAnswer || null;
-          console.log(`🔍 Non-multiple choice question ${question.questionNumber}: singleCorrectAnswer = "${question.singleCorrectAnswer}", stored as: "${correctOption}"`);
-          
-          if (!correctOption) {
-            throw new Error(`Question ${question.questionNumber}: Non-multiple choice questions must have a correct answer`);
+          if (question.singleCorrectAnswer) {
+            correctOptions = [question.singleCorrectAnswer];
           }
+          
+          console.log(`🔍 Non-multiple choice question ${question.questionNumber}: singleCorrectAnswer = "${question.singleCorrectAnswer}", stored as: ${JSON.stringify(correctOptions)}`);
         }
 
-        // Insert question
-        const questionResult = await client.query(`
-          INSERT INTO questions (
-            paper_id, 
-            question_number, 
-            question_text, 
-            question_format, 
-            options, 
-            correct_option, 
-            correct_options,
-            points_per_blank,
-            weightages
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id
-        `, [
-          paperId,
-          question.questionNumber,
-          question.questionText,
-          question.isMultipleChoice ? 'multiple_choice' : 'text',
-          JSON.stringify(options),
-          correctOption,
-          JSON.stringify(correctOptions),
-          question.totalMarks,
-          JSON.stringify(weightages)
-        ]);
+        // Ensure at least one correct answer
+        if (correctOptions.length === 0) {
+          throw new Error(`Question ${question.questionNumber}: Questions must have at least one correct answer`);
+        }
 
-        console.log(`✅ Inserted question ${question.questionNumber}: ${questionResult.rows[0].id}`);
+        // Validate and parse total marks
+        const totalMarks = parseFloat(question.totalMarks);
+        const pointsPerBlank = !isNaN(totalMarks) && totalMarks >= 0 ? totalMarks : 1;
+        
+        console.log(`  Total marks: ${question.totalMarks} → parsed as ${pointsPerBlank}`);
+        console.log(`  Weightages: ${JSON.stringify(weightages)}`);
+
+        // Insert question
+        const questionResult = await tx.question.create({
+          data: {
+            paperId: paper.id,
+            questionNumber: question.questionNumber,
+            questionText: question.questionText,
+            questionFormat: question.isMultipleChoice ? 'multiple_choice' : 'text',
+            options: options,
+            correctOptions: correctOptions,
+            pointsPerBlank: pointsPerBlank,
+            weightages: weightages
+          }
+        });
+
+        console.log(`✅ Inserted question ${question.questionNumber}: ${questionResult.id}`);
       }
 
-      await client.query('COMMIT');
-      
-      res.json({
-        success: true,
-        message: 'Manual test created successfully',
-        paperId: paperId,
-        questionsCount: questions.length
-      });
-
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+      return paper;
+    });
+    
+    res.json({
+      success: true,
+      message: 'Manual test created successfully',
+      paperId: result.id,
+      questionsCount: questions.length
+    });
 
   } catch (error) {
     console.error('Error creating manual test:', error);
@@ -122,32 +116,28 @@ router.get('/manual/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Get paper details
-    const paperResult = await pool.query(
-      'SELECT * FROM papers WHERE id = $1',
-      [id]
-    );
+    // Get paper details with questions
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(id) },
+      include: {
+        questions: {
+          orderBy: { questionNumber: 'asc' }
+        }
+      }
+    });
 
-    if (paperResult.rows.length === 0) {
+    if (!paper) {
       return res.status(404).json({ error: 'Test not found' });
     }
 
-    const paper = paperResult.rows[0];
-
-    // Get questions
-    const questionsResult = await pool.query(
-      'SELECT * FROM questions WHERE paper_id = $1 ORDER BY question_number',
-      [id]
-    );
-
-    const questions = questionsResult.rows.map(q => ({
+    const questions = paper.questions.map(q => ({
       id: q.id,
-      questionNumber: q.question_number,
-      questionText: q.question_text,
-      isMultipleChoice: q.question_format === 'multiple_choice',
+      questionNumber: q.questionNumber,
+      questionText: q.questionText,
+      isMultipleChoice: q.questionFormat === 'multiple_choice',
       options: q.options || {},
-      correctOptions: q.correct_options || [],
-      totalMarks: q.points_per_blank || 1,
+      correctOptions: q.correctOptions || [],
+      totalMarks: q.pointsPerBlank || 1,
       weightages: q.weightages || {}
     }));
 
@@ -175,26 +165,25 @@ router.put('/manual/:id', async (req, res) => {
       return res.status(400).json({ error: 'Test name and questions are required' });
     }
 
-    // Start transaction
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
+    // Use Prisma transaction
+    await prisma.$transaction(async (tx) => {
       // Update paper
-      await client.query(`
-        UPDATE papers 
-        SET name = $1, question_count = $2
-        WHERE id = $3
-      `, [testName, questions.length, id]);
+      await tx.paper.update({
+        where: { id: parseInt(id) },
+        data: {
+          name: testName
+        }
+      });
 
       // Delete existing questions
-      await client.query('DELETE FROM questions WHERE paper_id = $1', [id]);
+      await tx.question.deleteMany({
+        where: { paperId: parseInt(id) }
+      });
 
       // Insert updated questions
       for (let i = 0; i < questions.length; i++) {
         const question = questions[i];
         
-        let correctOption = null;
         let correctOptions = [];
         let options = {};
         let weightages = {};
@@ -204,55 +193,44 @@ router.put('/manual/:id', async (req, res) => {
             options[opt.id] = opt.text;
             if (opt.isCorrect) {
               correctOptions.push(opt.id);
-              weightages[opt.id] = opt.weight;
+              // Handle weightage - allow 0 and decimal values
+              const weight = parseFloat(opt.weight);
+              if (!isNaN(weight) && weight >= 0) {
+                weightages[opt.id] = weight;
+              } else {
+                // Default to 1 if invalid weight
+                weightages[opt.id] = 1;
+              }
             }
           });
-
-          if (correctOptions.length === 1) {
-            correctOption = correctOptions[0];
-          } else if (correctOptions.length > 1) {
-            correctOption = correctOptions.join(',');
-          }
+        } else if (question.singleCorrectAnswer) {
+          correctOptions = [question.singleCorrectAnswer];
         }
 
-        await client.query(`
-          INSERT INTO questions (
-            paper_id, 
-            question_number, 
-            question_text, 
-            question_format, 
-            options, 
-            correct_option, 
-            correct_options,
-            points_per_blank,
-            weightages
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [
-          id,
-          question.questionNumber,
-          question.questionText,
-          question.isMultipleChoice ? 'multiple_choice' : 'text',
-          JSON.stringify(options),
-          correctOption,
-          JSON.stringify(correctOptions),
-          question.totalMarks,
-          JSON.stringify(weightages)
-        ]);
+        // Ensure at least one correct answer
+        if (correctOptions.length === 0) {
+          correctOptions = ['A']; // Default fallback
+        }
+
+        await tx.question.create({
+          data: {
+            paperId: parseInt(id),
+            questionNumber: question.questionNumber,
+            questionText: question.questionText,
+            questionFormat: question.isMultipleChoice ? 'multiple_choice' : 'text',
+            options: options,
+            correctOptions: correctOptions,
+            pointsPerBlank: question.totalMarks,
+            weightages: weightages
+          }
+        });
       }
-
-      await client.query('COMMIT');
-      
-      res.json({
-        success: true,
-        message: 'Manual test updated successfully'
-      });
-
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
+    
+    res.json({
+      success: true,
+      message: 'Manual test updated successfully'
+    });
 
   } catch (error) {
     console.error('Error updating manual test:', error);

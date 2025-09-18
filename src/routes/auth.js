@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const pool = require('../db');
+const prisma = require('../prisma');
 
 const router = express.Router();
 
@@ -15,16 +15,16 @@ router.post('/login', async (req, res) => {
     }
 
     // Find admin by username
-    const result = await pool.query('SELECT * FROM admins WHERE username = $1', [username]);
+    const admin = await prisma.admin.findUnique({
+      where: { username }
+    });
     
-    if (result.rows.length === 0) {
+    if (!admin) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const admin = result.rows[0];
-
     // Check password
-    const isValidPassword = await bcrypt.compare(password, admin.password_hash);
+    const isValidPassword = await bcrypt.compare(password, admin.passwordHash);
     
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });

@@ -6,10 +6,14 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "test": "node src/test-db.js"
+    "setup-admin": "node src/setup-admin.js",
+    "db:generate": "npx prisma generate",
+    "db:migrate": "npx prisma migrate dev",
+    "db:studio": "npx prisma studio"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@prisma/client": "^6.16.2",
     "bcrypt": "^5.1.1",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
@@ -19,7 +23,7 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
     "node-fetch": "^2.7.0",
-    "pg": "^8.11.3"
+    "prisma": "^6.16.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

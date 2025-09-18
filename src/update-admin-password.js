@@ -1,5 +1,5 @@
 const bcrypt = require('bcrypt');
-const pool = require('./db');
+const prisma = require('./prisma');
 
 async function updateAdminPassword() {
   try {
@@ -10,37 +10,31 @@ async function updateAdminPassword() {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
     
-    // Update admin password
-    const result = await pool.query(
-      'UPDATE admins SET password_hash = $1 WHERE username = $2 RETURNING id, username',
-      [hashedPassword, 'admin']
-    );
+    // Update or create admin using upsert
+    const admin = await prisma.admin.upsert({
+      where: { username: 'admin' },
+      update: { passwordHash: hashedPassword },
+      create: {
+        username: 'admin',
+        passwordHash: hashedPassword
+      }
+    });
     
-    if (result.rows.length > 0) {
-      console.log('✅ Password updated successfully for admin:', result.rows[0].username);
-    } else {
-      console.log('❌ Admin user not found, creating new admin...');
-      
-      // Create new admin user
-      const insertResult = await pool.query(
-        'INSERT INTO admins (username, password_hash) VALUES ($1, $2) RETURNING id, username',
-        ['admin', hashedPassword]
-      );
-      
-      console.log('✅ New admin created:', insertResult.rows[0].username);
-    }
+    console.log('✅ Password updated successfully for admin:', admin.username);
     
     // Verify the password
-    const verifyResult = await pool.query('SELECT password_hash FROM admins WHERE username = $1', ['admin']);
-    const isValid = await bcrypt.compare(newPassword, verifyResult.rows[0].password_hash);
+    const verifyAdmin = await prisma.admin.findUnique({
+      where: { username: 'admin' }
+    });
     
+    const isValid = await bcrypt.compare(newPassword, verifyAdmin.passwordHash);
     console.log('🔐 Password verification:', isValid ? 'SUCCESS' : 'FAILED');
-    
-    await pool.end();
     
   } catch (error) {
     console.error('❌ Error updating admin password:', error.message);
     process.exit(1);
+  } finally {
+    await prisma.$disconnect();
   }
 }
 

@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const jwt = require('jsonwebtoken');
-const pool = require('../db');
+const prisma = require('../prisma');
 const { GeminiService } = require('../../services/geminiService');
 const GoogleDriveService = require('../../services/googleDriveService');
 const OMRService = require('../../services/omrService');
@@ -45,8 +45,7 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
       // Prepare questions for OMR evaluation
       const omrQuestions = correctAnswers.map(q => ({
         question_number: q.question_number,
-        correct_option: q.correct_option,
-        correct_options: q.correct_options ? JSON.parse(q.correct_options) : null
+        correct_options: q.correct_options || ["A"]
       }));
 
       // Convert student answers to OMR format
@@ -88,21 +87,12 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
   // Create a map of correct answers for quick lookup
   const correctAnswerMap = {};
   correctAnswers.forEach(q => {
-    // PRIORITIZE multiple correct answers from correct_options JSON column
-    if (q.correct_options && q.correct_options !== null) {
-      // correct_options is already parsed as array by PostgreSQL JSONB
-      if (Array.isArray(q.correct_options)) {
-        correctAnswerMap[q.question_number] = q.correct_options;
-      } else {
-        // Handle edge case where it might be a single value
-        correctAnswerMap[q.question_number] = [q.correct_options];
-      }
-    } else if (q.correct_option && q.correct_option !== null) {
-      // Use single correct_option as fallback
-      correctAnswerMap[q.question_number] = [q.correct_option];
+    // Use correct_options JSON column
+    if (q.correct_options && Array.isArray(q.correct_options)) {
+      correctAnswerMap[q.question_number] = q.correct_options;
     } else {
-      // No correct answers found
-      correctAnswerMap[q.question_number] = [];
+      // Default fallback
+      correctAnswerMap[q.question_number] = ["A"];
     }
   });
 
@@ -199,29 +189,30 @@ const uploadAnswer = (req, res, next) => {
 // Submit student answer sheet
 router.post('/submit', uploadAnswer, async (req, res) => {
   try {
-    const { paperId, studentName } = req.body;
+    const { paperId, studentName, rollNo } = req.body;
     const files = req.files || [];
 
-    if (!paperId || !studentName) {
-      return res.status(400).json({ error: 'Paper ID and student name are required' });
+    if (!paperId || !studentName || !rollNo) {
+      return res.status(400).json({ error: 'Paper ID, student name, and roll number are required' });
     }
 
     if (files.length === 0) {
       return res.status(400).json({ error: 'Answer sheet image(s) are required' });
     }
 
-    console.log(`Starting student answer sheet evaluation... (${files.length} file(s))`);
-    console.log('Processing files from memory buffer');
+    console.log(`🎓 Student submission: ${studentName} (Roll: ${rollNo}) - ${files.length} file(s)`);
 
     // Check if paper exists and get its page count and question type
-    const paperResult = await pool.query('SELECT * FROM papers WHERE id = $1', [paperId]);
-    if (paperResult.rows.length === 0) {
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(paperId) }
+    });
+    
+    if (!paper) {
       return res.status(404).json({ error: 'Paper not found' });
     }
     
-    const paper = paperResult.rows[0];
-    const expectedPages = paper.total_pages || 1;
-    const questionType = paper.question_type || 'traditional';
+    const expectedPages = paper.totalPages || 1;
+    const questionType = paper.questionType || 'traditional';
     
     console.log(`📋 Paper info: ${paper.name} (${questionType} type, ${expectedPages} pages)`);
     
@@ -234,21 +225,36 @@ router.post('/submit', uploadAnswer, async (req, res) => {
 
     console.log(`✓ Page count validation passed: ${files.length}/${expectedPages} pages`);
 
-    // For now, process only the first file (single-page logic)
-    // TODO: Implement multi-page processing
-    const file = files[0];
-
-    // Step 1: Upload answer sheet to Google Drive with temporary name
-    console.log('📤 Step 1: Uploading answer sheet to Google Drive...');
-    let driveFileId = null;
+    // Step 1: Upload all answer sheets to Google Drive with roll number naming
+    console.log('📤 Step 1: Uploading answer sheets to Google Drive...');
+    const uploadedImages = [];
+    
     try {
-      const tempUploadResult = await googleDriveService.uploadTempAnswerSheet(
-        file.buffer,
-        `temp-${studentName}-${Date.now()}.png`,
-        studentName
-      );
-      driveFileId = tempUploadResult.fileId;
-      console.log(`✓ Temporary file uploaded with ID: ${driveFileId}`);
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const pageNumber = i + 1;
+        const fileName = `${studentName}_${rollNo}_page${pageNumber}.png`;
+        
+        console.log(`📤 Uploading page ${pageNumber}: ${fileName}`);
+        
+        const uploadResult = await googleDriveService.uploadTempAnswerSheet(
+          file.buffer,
+          fileName,
+          `${studentName} - Roll: ${rollNo}`
+        );
+        
+        uploadedImages.push({
+          pageNumber: pageNumber,
+          fileName: fileName,
+          fileId: uploadResult.fileId,
+          webViewLink: uploadResult.webViewLink
+        });
+        
+        console.log(`✓ Page ${pageNumber} uploaded with ID: ${uploadResult.fileId}`);
+      }
+      
+      console.log(`✓ All ${files.length} pages uploaded successfully`);
+      
     } catch (driveError) {
       console.error('❌ Failed to upload to Google Drive:', driveError);
       return res.status(500).json({ 
@@ -256,224 +262,55 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       });
     }
 
-    // Step 2: Extract student answers using appropriate method based on question type
-    console.log(`🔍 Step 2: Processing ${questionType} answer sheet with Gemini...`);
+    // Step 2: Store submission in database WITHOUT evaluation (pending status)
+    console.log('� Step 2: Storing submission in database (pending evaluation)...');
     
-    let studentAnswers = [];
-    let geminiResult = { success: false };
-    let evaluationMethod = 'traditional';
-
-    // Get questions for context
-    const questionsResult = await pool.query(
-      'SELECT question_number, question_text, correct_option, options, question_format, blank_positions FROM questions WHERE paper_id = $1 ORDER BY question_number',
-      [paperId]
-    );
-    const questions = questionsResult.rows;
-
-    // Check if this is a fill-in-the-blanks paper
-    const hasFillBlanks = questions.some(q => q.question_format === 'fill_blanks');
+    // Create image URLs string from uploaded images
+    const imageUrls = uploadedImages.map(img => img.webViewLink).join(',');
     
-    if (hasFillBlanks) {
-      // Use fill-in-the-blanks processing
-      try {
-        const fillBlanksResult = await fillBlanksService.extractStudentFillBlanksFromBuffer(file.buffer, questions);
-        if (fillBlanksResult.success && fillBlanksResult.answers.length > 0) {
-          studentAnswers = fillBlanksResult.answers;
-          geminiResult = { success: true, answers: studentAnswers };
-          evaluationMethod = 'fill_blanks_ai';
-          console.log(`✓ Fill-blanks extraction found ${studentAnswers.length} answers`);
+    try {
+      const submission = await prisma.studentSubmission.create({
+        data: {
+          paperId: parseInt(paperId),
+          studentName: studentName,
+          rollNo: rollNo,
+          imageUrl: imageUrls,
+          score: 0,
+          totalQuestions: 0,
+          percentage: 0,
+          submittedAt: new Date(),
+          answerTypes: {},
+          evaluationMethod: 'pending',
+          evaluationStatus: 'pending'
         }
-      } catch (fillBlanksError) {
-        console.error('❌ Fill-blanks extraction failed:', fillBlanksError.message);
-      }
-    }
-    
-    if (!geminiResult.success && (questionType === 'omr' || questionType === 'mixed')) {
-      // Use OMR detection for OMR-type papers
-      try {
-        const omrResult = await omrService.detectOMRAnswers(file.buffer, questions);
-        if (omrResult && omrResult.detected_answers && omrResult.detected_answers.length > 0) {
-          // Convert new OMR format to standard format
-          studentAnswers = omrResult.detected_answers.map(answer => ({
-            question: answer.question,
-            // Keep selectedOptions as the primary field for multiple selections
-            selectedOptions: answer.selected_options ? answer.selected_options.map(opt => opt.toUpperCase()) : 
-                            (answer.selected_option ? [answer.selected_option.toUpperCase()] : []),
-            // Keep selectedOption for backward compatibility (use first option or comma-separated string)
-            selectedOption: answer.selected_options && answer.selected_options.length > 0 ? 
-                           (answer.selected_options.length === 1 ? answer.selected_options[0].toUpperCase() : 
-                            answer.selected_options.map(opt => opt.toUpperCase()).join(',')) :
-                           (answer.selected_option ? answer.selected_option.toUpperCase() : null),
-            confidence: answer.confidence,
-            marking_type: answer.marking_type
-          }));
-          geminiResult = { success: true, answers: studentAnswers };
-          evaluationMethod = 'omr_detection';
-          console.log(`✓ OMR Detection found ${studentAnswers.length} answers`);
-        } else {
-          console.log('⚠️ OMR detection found no answers, falling back to traditional extraction');
-        }
-      } catch (omrError) {
-        console.error('❌ OMR detection failed, falling back to traditional:', omrError.message);
-      }
-    }
+      });
 
-    // Fall back to traditional extraction if other methods failed
-    if (!geminiResult.success) {
-      geminiResult = await geminiService.extractStudentAnswersFromBuffer(file.buffer);
-      if (geminiResult.success) {
-        // Normalize case for traditional extraction results
-        studentAnswers = geminiResult.answers.map(answer => ({
-          question: answer.question,
-          selectedOption: answer.selectedOption?.toUpperCase() || null,
-          selectedOptions: answer.selectedOptions ? 
-            answer.selectedOptions.map(opt => opt.toUpperCase()) : 
-            [answer.selectedOption?.toUpperCase()].filter(Boolean)
-        }));
-        evaluationMethod = 'gemini_vision';
-        console.log(`✓ Traditional extraction found ${studentAnswers.length} answers`);
-      }
-    }
+      console.log(`✅ Submission stored successfully with ID: ${submission.id}`);
+      
+      // Return success response without evaluation results
+      res.json({
+        success: true,
+        message: 'Answer sheet submitted successfully and is pending evaluation',
+        submissionId: submission.id,
+        studentName: studentName,
+        rollNo: rollNo,
+        submittedAt: submission.submittedAt,
+        status: 'pending',
+        uploadedPages: uploadedImages.length,
+        note: 'Your submission will be evaluated by the admin. Results will be available after evaluation.'
+      });
 
-    if (!geminiResult.success) {
-      console.log('❌ Answer extraction failed');
+    } catch (dbError) {
+      console.error('❌ Database error:', dbError);
       return res.status(500).json({ 
-        error: 'Failed to process answer sheet: ' + (geminiResult.error || 'No answers detected') 
+        error: 'Failed to store submission in database: ' + dbError.message 
       });
     }
 
-    // Get correct answers from database (including multiple correct answers support)
-    const correctAnswersResult = await pool.query(
-      'SELECT question_number, correct_option, correct_options, question_format, blank_positions FROM questions WHERE paper_id = $1 ORDER BY question_number',
-      [paperId]
-    );
-
-    const correctAnswers = correctAnswersResult.rows;
-
-    if (correctAnswers.length === 0) {
-      return res.status(400).json({ error: 'No questions found for this paper' });
-    }
-
-    // Step 3: Evaluate student answers against correct answers
-    console.log('📊 Step 3: Evaluating answers...');
-    
-    // Determine the primary question format for evaluation
-    const questionFormats = correctAnswers.map(q => q.question_format || 'multiple_choice');
-    const hasFillBlanksQuestions = questionFormats.includes('fill_blanks');
-    const primaryFormat = hasFillBlanksQuestions ? 'fill_blanks' : 'multiple_choice';
-    
-    const evaluation = evaluateAnswers(correctAnswers, studentAnswers, primaryFormat, evaluationMethod);
-
-    // Step 4: Rename the temporary file with score information
-    console.log('🏷️ Step 4: Renaming file with score information...');
-    const sanitizedStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
-    const sanitizedPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
-    const percentage = Math.round((evaluation.score / evaluation.totalQuestions) * 100);
-    const finalFileName = `${sanitizedStudentName}_${sanitizedPaperName}_Score${evaluation.score}of${evaluation.totalQuestions}(${percentage}%).jpg`;
-    
-    try {
-      await googleDriveService.renameFileInDrive(driveFileId, finalFileName);
-      console.log(`✓ File renamed to: ${finalFileName}`);
-    } catch (renameError) {
-      console.error('❌ Failed to rename file:', renameError);
-      // Continue with the process even if rename fails
-    }
-
-    // Step 5: Insert submission into database
-    console.log('💾 Step 5: Saving submission to database...');
-    const submissionResult = await pool.query(`
-      INSERT INTO student_submissions (paper_id, student_name, score, total_questions, percentage, evaluation_method) 
-      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
-    `, [paperId, studentName, evaluation.score, evaluation.totalQuestions, evaluation.percentage, evaluationMethod]);
-
-    const submission = submissionResult.rows[0];
-
-    // Insert individual student answers
-    if (primaryFormat === 'fill_blanks' && evaluation.results) {
-      // Handle fill-in-the-blanks answers
-      for (const result of evaluation.results) {
-        const studentAnswer = studentAnswers.find(a => a.question === result.questionNumber);
-        await pool.query(`
-          INSERT INTO student_answers (submission_id, question_number, selected_option, is_correct, text_answer, blank_answers) 
-          VALUES ($1, $2, $3, $4, $5, $6)
-        `, [
-          submission.id, 
-          result.questionNumber, 
-          null, // No selected option for fill-blanks
-          result.score > 0,
-          null, // Legacy field
-          JSON.stringify(studentAnswer?.blankAnswers || [])
-        ]);
-      }
-    } else {
-      // Handle multiple choice answers
-      for (const answerResult of evaluation.answerResults) {
-        const studentAnswer = studentAnswers.find(a => a.question === answerResult.questionNumber);
-        
-        // Prepare selected options for storage
-        let selectedOptionsForDB = null;
-        let selectedOptionForDB = null;
-        
-        if (studentAnswer && studentAnswer.selectedOptions && studentAnswer.selectedOptions.length > 0) {
-          // Store multiple selections as JSONB array
-          selectedOptionsForDB = JSON.stringify(studentAnswer.selectedOptions);
-          // Store primary selection for backward compatibility
-          selectedOptionForDB = studentAnswer.selectedOptions.length === 1 ? 
-                                studentAnswer.selectedOptions[0] : 
-                                studentAnswer.selectedOptions.join(',');
-        } else {
-          // Fallback to answerResult data
-          selectedOptionForDB = answerResult.studentOption?.toUpperCase() || null;
-          if (selectedOptionForDB && selectedOptionForDB.includes(',')) {
-            // Convert comma-separated string back to array
-            selectedOptionsForDB = JSON.stringify(selectedOptionForDB.split(','));
-          } else if (selectedOptionForDB) {
-            selectedOptionsForDB = JSON.stringify([selectedOptionForDB]);
-          }
-        }
-
-        await pool.query(`
-          INSERT INTO student_answers (submission_id, question_number, selected_option, selected_options, is_correct) 
-          VALUES ($1, $2, $3, $4, $5)
-        `, [
-          submission.id, 
-          answerResult.questionNumber, 
-          selectedOptionForDB, 
-          selectedOptionsForDB,
-          answerResult.isCorrect
-        ]);
-      }
-    }
-
-    console.log(`Answer sheet evaluated: ${evaluation.score}/${evaluation.totalQuestions} (${evaluation.percentage.toFixed(2)}%) - ${questionType} type`);
-
-    console.log('✅ Process completed successfully!');
-    res.json({
-      message: 'Answer sheet submitted and stored successfully',
-      success: true,
-      submissionId: submission.id,  // Include the submission ID
-      studentName: studentName,
-      paperName: paper.name,
-      questionType: questionType,
-      evaluationMethod: evaluationMethod,
-      score: `${evaluation.score}/${evaluation.totalQuestions}`,
-      percentage: `${evaluation.percentage.toFixed(2)}%`,
-      driveInfo: {
-        uploadedToDrive: true,
-        processSteps: [
-          '✓ Uploaded to Google Drive',
-          `✓ Processed with ${questionType === 'omr' ? 'OMR Detection' : 'Traditional Gemini AI'}`,
-          '✓ Evaluated answers',
-          '✓ Final file uploaded with score',
-          '✓ Saved to database'
-        ]
-      }
-    });
-
   } catch (error) {
-    console.error('Error submitting answer sheet:', error);
+    console.error('❌ Submission error:', error);
     res.status(500).json({ 
-      error: 'Failed to submit answer sheet: ' + error.message 
+      error: 'Failed to process submission: ' + error.message 
     });
   }
 });
@@ -481,17 +318,237 @@ router.post('/submit', uploadAnswer, async (req, res) => {
 // Get all submissions for a paper
 router.get('/paper/:paperId', async (req, res) => {
   try {
-    const paperId = req.params.paperId;
+    const paperId = parseInt(req.params.paperId);
 
-    const result = await pool.query(`
-      SELECT * FROM student_submissions 
-      WHERE paper_id = $1 
-      ORDER BY submitted_at DESC
-    `, [paperId]);
+    const submissions = await prisma.studentSubmission.findMany({
+      where: { paperId: paperId },
+      include: {
+        paper: {
+          select: { name: true }
+        }
+      },
+      orderBy: { submittedAt: 'desc' }
+    });
 
-    res.json(result.rows);
+    res.json(submissions);
   } catch (error) {
     console.error('Error fetching submissions:', error);
+    res.status(500).json({ error: 'Failed to fetch submissions' });
+  }
+});
+
+// Admin endpoint to evaluate a specific submission
+router.post('/evaluate/:submissionId', async (req, res) => {
+  try {
+    const submissionId = parseInt(req.params.submissionId);
+
+    // Get submission details
+    const submission = await prisma.studentSubmission.findUnique({
+      where: { id: submissionId },
+      include: {
+        paper: true
+      }
+    });
+
+    if (!submission) {
+      return res.status(404).json({ error: 'Submission not found' });
+    }
+
+    if (submission.evaluationStatus === 'evaluated') {
+      return res.status(400).json({ error: 'Submission already evaluated' });
+    }
+
+    console.log(`🎓 Starting evaluation for ${submission.studentName} (Roll: ${submission.rollNo})`);
+
+    // Get questions for this paper
+    const questions = await prisma.question.findMany({
+      where: { paperId: submission.paperId },
+      orderBy: { questionNumber: 'asc' }
+    });
+
+    // Get image URLs from submission
+    const imageUrls = submission.imageUrl.split(',');
+    
+    // Step 1: Download images from Google Drive and process each one
+    let allStudentAnswers = [];
+    let rollNoFromPaper = null;
+    
+    for (let i = 0; i < imageUrls.length; i++) {
+      const imageUrl = imageUrls[i];
+      const pageNumber = i + 1;
+      
+      console.log(`📄 Processing page ${pageNumber}...`);
+      
+      try {
+        // Download image from Google Drive
+        const imageBuffer = await googleDriveService.downloadImage(imageUrl);
+        
+        // Extract roll number from first page if not already extracted
+        if (pageNumber === 1) {
+          console.log('🔍 Extracting roll number from question paper...');
+          const rollNoResult = await geminiService.extractRollNumberFromImage(imageBuffer);
+          if (rollNoResult.success) {
+            rollNoFromPaper = rollNoResult.rollNumber;
+            console.log(`📋 Roll number from paper: ${rollNoFromPaper}`);
+          }
+        }
+        
+        // Process answers based on question type
+        const questionType = submission.paper.questionType || 'traditional';
+        let pageAnswers = [];
+        
+        if (questionType === 'omr' || questionType === 'mixed') {
+          // Use OMR detection
+          const omrResult = await omrService.detectOMRAnswers(imageBuffer, questions);
+          if (omrResult && omrResult.detected_answers) {
+            pageAnswers = omrResult.detected_answers;
+          }
+        }
+        
+        if (pageAnswers.length === 0) {
+          // Fall back to traditional Gemini extraction
+          const geminiResult = await geminiService.extractStudentAnswersFromBuffer(imageBuffer);
+          if (geminiResult.success) {
+            pageAnswers = geminiResult.answers;
+          }
+        }
+        
+        allStudentAnswers = allStudentAnswers.concat(pageAnswers);
+        
+      } catch (imageError) {
+        console.error(`❌ Failed to process page ${pageNumber}:`, imageError);
+      }
+    }
+
+    // Step 2: Validate roll number
+    if (rollNoFromPaper && rollNoFromPaper !== submission.rollNo) {
+      console.log(`❌ Roll number mismatch: Paper shows ${rollNoFromPaper}, but student entered ${submission.rollNo}`);
+      
+      await prisma.studentSubmission.update({
+        where: { id: submissionId },
+        data: {
+          evaluationStatus: 'error',
+          evaluationMethod: 'roll_number_mismatch'
+        }
+      });
+      
+      return res.status(400).json({ 
+        error: 'Roll number mismatch',
+        message: `The roll number in the question paper (${rollNoFromPaper}) does not match the roll number you entered (${submission.rollNo})`,
+        paperRollNo: rollNoFromPaper,
+        enteredRollNo: submission.rollNo
+      });
+    }
+
+    // Step 3: Evaluate answers
+    console.log('📊 Evaluating answers...');
+    
+    const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', 'gemini_vision');
+    
+    // Step 4: Store results in database
+    await prisma.$transaction(async (tx) => {
+      // Update submission
+      await tx.studentSubmission.update({
+        where: { id: submissionId },
+        data: {
+          score: evaluationResult.score,
+          totalQuestions: evaluationResult.totalQuestions,
+          percentage: evaluationResult.percentage,
+          evaluationStatus: 'evaluated',
+          evaluationMethod: 'admin_triggered',
+          answerTypes: evaluationResult.answerTypes || {}
+        }
+      });
+
+      // Store individual answers
+      for (const result of evaluationResult.results) {
+        await tx.studentAnswer.create({
+          data: {
+            submissionId: submissionId,
+            questionNumber: result.questionNumber,
+            selectedOption: result.selectedOption,
+            selectedOptions: result.selectedOptions || [result.selectedOption],
+            isCorrect: result.isCorrect,
+            textAnswer: result.textAnswer,
+            answerType: result.answerType || 'mcq'
+          }
+        });
+      }
+    });
+
+    console.log(`✅ Evaluation completed for ${submission.studentName} (Roll: ${submission.rollNo})`);
+    console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
+
+    res.json({
+      success: true,
+      message: 'Evaluation completed successfully',
+      studentName: submission.studentName,
+      rollNo: submission.rollNo,
+      score: evaluationResult.score,
+      totalQuestions: evaluationResult.totalQuestions,
+      percentage: evaluationResult.percentage,
+      evaluationStatus: 'evaluated'
+    });
+
+  } catch (error) {
+    console.error('❌ Evaluation error:', error);
+    
+    // Update submission status to error
+    try {
+      await prisma.studentSubmission.update({
+        where: { id: parseInt(req.params.submissionId) },
+        data: {
+          evaluationStatus: 'error',
+          evaluationMethod: 'evaluation_failed'
+        }
+      });
+    } catch (updateError) {
+      console.error('Failed to update submission status:', updateError);
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to evaluate submission: ' + error.message 
+    });
+  }
+});
+
+// Get submissions by evaluation status
+router.get('/paper/:paperId/status/:status', async (req, res) => {
+  try {
+    const paperId = parseInt(req.params.paperId);
+    const status = req.params.status; // 'pending' or 'evaluated'
+    const { search } = req.query; // Optional roll number search
+
+    let whereClause = { 
+      paperId: paperId,
+      evaluationStatus: status
+    };
+
+    // Add roll number search if provided
+    if (search) {
+      whereClause.rollNo = {
+        contains: search,
+        mode: 'insensitive'
+      };
+    }
+
+    const submissions = await prisma.studentSubmission.findMany({
+      where: whereClause,
+      include: {
+        paper: {
+          select: { name: true }
+        }
+      },
+      orderBy: { submittedAt: 'desc' }
+    });
+
+    res.json({
+      status: status,
+      count: submissions.length,
+      submissions: submissions
+    });
+  } catch (error) {
+    console.error('Error fetching submissions by status:', error);
     res.status(500).json({ error: 'Failed to fetch submissions' });
   }
 });
@@ -499,34 +556,54 @@ router.get('/paper/:paperId', async (req, res) => {
 // Get submission details
 router.get('/:id', async (req, res) => {
   try {
-    const submissionId = req.params.id;
+    const submissionId = parseInt(req.params.id);
 
-    // Get submission details
-    const submissionResult = await pool.query(`
-      SELECT s.*, p.name as paper_name 
-      FROM student_submissions s 
-      JOIN papers p ON s.paper_id = p.id 
-      WHERE s.id = $1
-    `, [submissionId]);
+    // Get submission details with paper name
+    const submission = await prisma.studentSubmission.findUnique({
+      where: { id: submissionId },
+      include: {
+        paper: {
+          select: { name: true }
+        },
+        answers: {
+          orderBy: { questionNumber: 'asc' }
+        }
+      }
+    });
 
-    if (submissionResult.rows.length === 0) {
+    if (!submission) {
       return res.status(404).json({ error: 'Submission not found' });
     }
 
-    // Get student answers
-    const answersResult = await pool.query(`
-      SELECT sa.*, q.question_text, q.correct_option, q.options, q.question_format
-      FROM student_answers sa 
-      JOIN questions q ON sa.question_number = q.question_number 
-      JOIN student_submissions s ON sa.submission_id = s.id
-      WHERE sa.submission_id = $1 AND q.paper_id = s.paper_id
-      ORDER BY sa.question_number
-    `, [submissionId]);
+    // Get question details for the answers
+    const questions = await prisma.question.findMany({
+      where: { paperId: submission.paperId },
+      select: {
+        questionNumber: true,
+        questionText: true,
+        correctOptions: true,
+        options: true,
+        questionFormat: true
+      }
+    });
 
-    const submission = submissionResult.rows[0];
-    submission.answers = answersResult.rows;
+    // Merge question details with answers
+    const answersWithQuestions = submission.answers.map(answer => {
+      const question = questions.find(q => q.questionNumber === answer.questionNumber);
+      return {
+        ...answer,
+        questionText: question?.questionText,
+        correctOptions: question?.correctOptions,
+        options: question?.options,
+        questionFormat: question?.questionFormat
+      };
+    });
 
-    res.json(submission);
+    res.json({
+      ...submission,
+      paper_name: submission.paper.name,
+      answers: answersWithQuestions
+    });
   } catch (error) {
     console.error('Error fetching submission details:', error);
     res.status(500).json({ error: 'Failed to fetch submission details' });

@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const pool = require('../db');
+const prisma = require('../prisma');
 const { GeminiService } = require('../../services/geminiService');
 const OMRService = require('../../services/omrService');
 const { FillBlanksService } = require('../../services/fillBlanksService');
@@ -56,15 +56,24 @@ const verifyToken = (req, res, next) => {
 // Get all papers (admin only - requires authentication)
 router.get('/', verifyToken, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT p.*, COUNT(q.id) as question_count 
-      FROM papers p 
-      LEFT JOIN questions q ON p.id = q.paper_id 
-      GROUP BY p.id, p.name, p.admin_id, p.uploaded_at, p.total_pages, p.question_type
-      ORDER BY p.uploaded_at DESC
-    `);
+    const papers = await prisma.paper.findMany({
+      include: {
+        questions: true,
+        _count: {
+          select: { questions: true }
+        }
+      },
+      orderBy: {
+        uploadedAt: 'desc'
+      }
+    });
     
-    res.json(result.rows);
+    const papersWithCount = papers.map(paper => ({
+      ...paper,
+      question_count: paper._count.questions
+    }));
+    
+    res.json(papersWithCount);
   } catch (error) {
     console.error('Error fetching papers:', error);
     res.status(500).json({ error: 'Failed to fetch papers' });
@@ -74,15 +83,28 @@ router.get('/', verifyToken, async (req, res) => {
 // Get all papers for students (public - no authentication required)
 router.get('/public', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT p.id, p.name, p.uploaded_at, p.total_pages, p.question_type, COUNT(q.id) as question_count 
-      FROM papers p 
-      LEFT JOIN questions q ON p.id = q.paper_id 
-      GROUP BY p.id, p.name, p.uploaded_at, p.total_pages, p.question_type
-      ORDER BY p.uploaded_at DESC
-    `);
+    const papers = await prisma.paper.findMany({
+      select: {
+        id: true,
+        name: true,
+        uploadedAt: true,
+        totalPages: true,
+        questionType: true,
+        _count: {
+          select: { questions: true }
+        }
+      },
+      orderBy: {
+        uploadedAt: 'desc'
+      }
+    });
     
-    res.json(result.rows);
+    const papersWithCount = papers.map(paper => ({
+      ...paper,
+      question_count: paper._count.questions
+    }));
+    
+    res.json(papersWithCount);
   } catch (error) {
     console.error('Error fetching public papers:', error);
     res.status(500).json({ error: 'Failed to fetch papers' });
@@ -207,12 +229,14 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
     console.log(`📝 Overall question type determined: ${overallQuestionType}`);
 
     // Insert paper into database with question type
-    const paperResult = await pool.query(
-      'INSERT INTO papers (name, admin_id, total_pages, question_type) VALUES ($1, $2, $3, $4) RETURNING *',
-      [name, req.admin.id, files.length, overallQuestionType]
-    );
-
-    const paper = paperResult.rows[0];
+    const paper = await prisma.paper.create({
+      data: {
+        name,
+        adminId: req.admin.id,
+        totalPages: files.length,
+        questionType: overallQuestionType
+      }
+    });
 
     // Insert extracted questions and correct answers
     for (const question of allQuestions) {
@@ -230,43 +254,35 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
         }
       }
       
-      // Determine correct answers - ensure constraint compliance
-      let correctOption = null;
-      let correctOptions = null;
-
-      if (question.correctAnswer && question.correctAnswer !== 'unknown') {
-        correctOption = question.correctAnswer.toUpperCase();
-      }
+      // Determine correct answers - use only correctOptions array
+      let correctOptions = [];
 
       if (question.correctAnswers && Array.isArray(question.correctAnswers) && question.correctAnswers.length > 0) {
-        correctOptions = JSON.stringify(question.correctAnswers.map(a => a.toUpperCase()));
+        correctOptions = question.correctAnswers.map(a => a.toUpperCase());
+      } else if (question.correctAnswer && question.correctAnswer !== 'unknown') {
+        correctOptions = [question.correctAnswer.toUpperCase()];
       }
 
-      // Ensure constraint compliance: at least one correct answer field must be valid
-      if (!correctOption && !correctOptions) {
-        // Default to first option 'A' if no correct answer is detected
+      // Ensure at least one correct answer
+      if (correctOptions.length === 0) {
         console.warn(`No correct answer detected for question ${question.number}, defaulting to 'A'`);
-        correctOption = 'A';
+        correctOptions = ['A'];
       }
       
-      await pool.query(
-        `INSERT INTO questions 
-         (paper_id, question_number, question_text, correct_option, correct_options, page_number, question_type, options, question_format, blank_positions, points_per_blank) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [
-          paper.id, 
-          question.number, 
-          question.text, 
-          correctOption, // Single answer (for backward compatibility)
-          correctOptions, // Multiple answers in JSON format
-          question.page, 
-          question.questionType,
-          JSON.stringify(options),
-          question.questionFormat || 'multiple_choice',
-          question.blankPositions ? JSON.stringify(question.blankPositions) : null,
-          question.totalPoints || 1
-        ]
-      );
+      await prisma.question.create({
+        data: {
+          paperId: paper.id,
+          questionNumber: question.number,
+          questionText: question.text,
+          correctOptions: correctOptions,
+          pageNumber: question.page,
+          questionType: question.questionType,
+          options: options,
+          questionFormat: question.questionFormat || 'multiple_choice',
+          blankPositions: question.blankPositions || {},
+          pointsPerBlank: question.totalPoints || 1
+        }
+      });
     }
 
     console.log(`Paper uploaded successfully with ${allQuestions.length} questions across ${files.length} pages`);
@@ -305,23 +321,21 @@ router.post('/upload', verifyToken, uploadMultiple, async (req, res) => {
 // Get paper details with questions
 router.get('/:id', verifyToken, async (req, res) => {
   try {
-    const paperId = req.params.id;
+    const paperId = parseInt(req.params.id);
 
-    // Get paper details
-    const paperResult = await pool.query('SELECT * FROM papers WHERE id = $1', [paperId]);
+    // Get paper details with questions
+    const paper = await prisma.paper.findUnique({
+      where: { id: paperId },
+      include: {
+        questions: {
+          orderBy: { questionNumber: 'asc' }
+        }
+      }
+    });
     
-    if (paperResult.rows.length === 0) {
+    if (!paper) {
       return res.status(404).json({ error: 'Paper not found' });
     }
-
-    // Get questions for this paper
-    const questionsResult = await pool.query(
-      'SELECT * FROM questions WHERE paper_id = $1 ORDER BY question_number',
-      [paperId]
-    );
-
-    const paper = paperResult.rows[0];
-    paper.questions = questionsResult.rows;
 
     res.json(paper);
   } catch (error) {
@@ -333,33 +347,21 @@ router.get('/:id', verifyToken, async (req, res) => {
 // Delete paper (admin only - requires authentication)
 router.delete('/:id', verifyToken, async (req, res) => {
   try {
-    const paperId = req.params.id;
+    const paperId = parseInt(req.params.id);
 
     // Check if paper exists
-    const paperResult = await pool.query('SELECT * FROM papers WHERE id = $1', [paperId]);
+    const paper = await prisma.paper.findUnique({
+      where: { id: paperId }
+    });
     
-    if (paperResult.rows.length === 0) {
+    if (!paper) {
       return res.status(404).json({ error: 'Paper not found' });
     }
 
-    // Delete related data in the correct order (due to foreign key constraints)
-    
-    // First, delete student answers that reference the submissions
-    await pool.query(`
-      DELETE FROM student_answers 
-      WHERE submission_id IN (
-        SELECT id FROM student_submissions WHERE paper_id = $1
-      )
-    `, [paperId]);
-    
-    // Then delete student submissions
-    await pool.query('DELETE FROM student_submissions WHERE paper_id = $1', [paperId]);
-    
-    // Then delete questions
-    await pool.query('DELETE FROM questions WHERE paper_id = $1', [paperId]);
-    
-    // Finally delete the paper
-    await pool.query('DELETE FROM papers WHERE id = $1', [paperId]);
+    // Delete the paper (cascade deletes will handle related data)
+    await prisma.paper.delete({
+      where: { id: paperId }
+    });
 
     console.log(`Paper with ID ${paperId} deleted successfully`);
     res.json({ message: 'Paper and all related data deleted successfully' });

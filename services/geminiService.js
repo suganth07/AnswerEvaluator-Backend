@@ -422,6 +422,83 @@ class GeminiService {
                 return 'image/jpeg'; // fallback
         }
     }
+
+    // Extract roll number from question paper image
+    async extractRollNumberFromImage(imageBuffer) {
+        try {
+            console.log('🔍 Extracting roll number from question paper...');
+            
+            const operation = async () => {
+                const imagePart = {
+                    inlineData: {
+                        data: imageBuffer.toString('base64'),
+                        mimeType: this.getMimeType(imageBuffer)
+                    }
+                };
+
+                const prompt = `
+                Analyze this question paper image and extract the student's roll number.
+
+                The roll number is typically found at the top of the page in boxes or fields labeled "Roll No", "Roll Number", "Student ID", or similar.
+                It may be written in separate boxes (one digit per box) or in a single field.
+
+                Look for:
+                1. Boxes at the top of the page with digits
+                2. Fields labeled "Roll No", "Roll Number", "Student ID"
+                3. Student information section at the top
+                4. Any numeric identifier that appears to be a roll number
+
+                Return ONLY a JSON object with this exact format:
+                {
+                    "rollNumber": "XX",
+                    "confidence": "high/medium/low",
+                    "location": "description of where found"
+                }
+
+                If no roll number is found, return:
+                {
+                    "rollNumber": null,
+                    "confidence": "none",
+                    "location": "not found"
+                }
+
+                Extract only the actual digits/numbers, without any labels.
+                `;
+
+                const result = await this.model.generateContent([prompt, imagePart]);
+                const response = await result.response;
+                const text = response.text();
+
+                console.log('🤖 Gemini roll number response:', text);
+
+                // Parse JSON response
+                const jsonMatch = text.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                    const parsed = JSON.parse(jsonMatch[0]);
+                    return {
+                        success: true,
+                        rollNumber: parsed.rollNumber,
+                        confidence: parsed.confidence,
+                        location: parsed.location
+                    };
+                }
+
+                return {
+                    success: false,
+                    error: 'Could not parse roll number from response'
+                };
+            };
+
+            return await this.withRetry(operation, 'Roll number extraction');
+
+        } catch (error) {
+            console.error('❌ Error extracting roll number:', error);
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
 }
 
 module.exports = { GeminiService };
