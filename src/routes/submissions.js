@@ -84,34 +84,50 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
   let score = 0;
   const answerResults = [];
 
+  console.log('🔍 Debug - Raw correctAnswers:', correctAnswers);
+  console.log('🔍 Debug - Raw studentAnswers:', studentAnswers);
+
   // Create a map of correct answers for quick lookup
   const correctAnswerMap = {};
   correctAnswers.forEach(q => {
-    // Use correct_options JSON column
-    if (q.correct_options && Array.isArray(q.correct_options)) {
-      correctAnswerMap[q.question_number] = q.correct_options;
+    // Handle both database field names (questionNumber/correctOptions) and API field names (question_number/correct_options)
+    const questionNum = q.questionNumber || q.question_number;
+    const correctOptions = q.correctOptions || q.correct_options;
+    
+    if (correctOptions && Array.isArray(correctOptions)) {
+      correctAnswerMap[questionNum] = correctOptions.map(opt => opt.toUpperCase());
     } else {
       // Default fallback
-      correctAnswerMap[q.question_number] = ["A"];
+      correctAnswerMap[questionNum] = ["A"];
     }
   });
+
+  console.log('🔍 Debug - correctAnswerMap:', correctAnswerMap);
 
   // Create a map of student answers for quick lookup
   const studentAnswerMap = {};
   studentAnswers.forEach(a => {
-    // Handle both single and multiple answers
+    // Handle both field name formats
+    const questionNum = a.question || a.questionNumber;
+    
     if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
-      studentAnswerMap[a.question] = a.selectedOptions.map(opt => opt.toUpperCase());
+      studentAnswerMap[questionNum] = a.selectedOptions.map(opt => opt.toUpperCase());
+    } else if (a.selectedOption) {
+      studentAnswerMap[questionNum] = [a.selectedOption.toUpperCase()];
     } else {
-      studentAnswerMap[a.question] = a.selectedOption ? [a.selectedOption.toUpperCase()] : [];
+      studentAnswerMap[questionNum] = [];
     }
   });
 
+  console.log('🔍 Debug - studentAnswerMap:', studentAnswerMap);
+
   // Evaluate each question
   for (const correctAnswer of correctAnswers) {
-    const questionNumber = correctAnswer.question_number;
+    const questionNumber = correctAnswer.questionNumber || correctAnswer.question_number;
     const correctOptions = correctAnswerMap[questionNumber] || [];
     const studentOptions = studentAnswerMap[questionNumber] || [];
+    
+    console.log(`🔍 Debug - Q${questionNumber}: Correct=[${correctOptions.join(',')}] Student=[${studentOptions.join(',')}]`);
     
     // Calculate if answer is correct based on array comparison
     let isCorrect = false;
@@ -119,11 +135,12 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
 
     if (correctOptions.length === 1) {
       // Single correct answer
-      isCorrect = studentOptions.length === 1 && studentOptions[0] === correctOptions[0].toUpperCase();
+      isCorrect = studentOptions.length === 1 && studentOptions[0] === correctOptions[0];
       partialScore = isCorrect ? 1 : 0;
+      console.log(`🔍 Debug - Q${questionNumber}: Single answer - isCorrect=${isCorrect}, score=${partialScore}`);
     } else {
       // Multiple correct answers - use proportional scoring
-      const correctSet = new Set(correctOptions.map(opt => opt.toUpperCase()));
+      const correctSet = new Set(correctOptions);
       const studentSet = new Set(studentOptions);
       
       const correctSelections = [...studentSet].filter(ans => correctSet.has(ans)).length;
@@ -137,6 +154,7 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
         partialScore = Math.round(partialScore * 100) / 100;
         isCorrect = partialScore >= 0.8; // Consider 80%+ as correct
       }
+      console.log(`🔍 Debug - Q${questionNumber}: Multiple answers - isCorrect=${isCorrect}, score=${partialScore}`);
     }
 
     if (isCorrect || partialScore > 0) score += partialScore;
@@ -152,10 +170,13 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
 
   const percentage = (score / totalQuestions) * 100;
 
+  console.log(`🔍 Debug - Final evaluation: score=${score}, total=${totalQuestions}, percentage=${percentage}`);
+
   return {
     score,
     totalQuestions,
     percentage,
+    results: answerResults,
     answerResults
   };
 };
@@ -240,7 +261,8 @@ router.post('/submit', uploadAnswer, async (req, res) => {
         const uploadResult = await googleDriveService.uploadTempAnswerSheet(
           file.buffer,
           fileName,
-          `${studentName} - Roll: ${rollNo}`
+          `${studentName} - Roll: ${rollNo}`,
+          rollNo
         );
         
         uploadedImages.push({
@@ -297,6 +319,14 @@ router.post('/submit', uploadAnswer, async (req, res) => {
         submittedAt: submission.submittedAt,
         status: 'pending',
         uploadedPages: uploadedImages.length,
+        driveInfo: {
+          uploadedToDrive: true,
+          processSteps: [
+            '✓ Uploaded to Google Drive',
+            '✓ Stored in database with pending status',
+            '✓ Awaiting admin evaluation'
+          ]
+        },
         note: 'Your submission will be evaluated by the admin. Results will be available after evaluation.'
       });
 
@@ -607,6 +637,349 @@ router.get('/:id', async (req, res) => {
   } catch (error) {
     console.error('Error fetching submission details:', error);
     res.status(500).json({ error: 'Failed to fetch submission details' });
+  }
+});
+
+// Get pending files from Google Drive (for new PENDING_ workflow)
+router.get('/pending-files/:paperId', async (req, res) => {
+  try {
+    const paperId = parseInt(req.params.paperId);
+    
+    // Get paper details to validate
+    const paper = await prisma.paper.findUnique({
+      where: { id: paperId }
+    });
+    
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+    
+    let pendingSubmissions = [];
+    
+    try {
+      // Get all PENDING_ files from Google Drive
+      const pendingFiles = await googleDriveService.listPendingFiles();
+      
+      // Parse file names to extract student info
+      const pendingFromDrive = pendingFiles
+        .map(file => {
+          // Extract info from PENDING_{name}_Roll_{rollno}.* format
+          const match = file.name.match(/^PENDING_(.+)_Roll_(\w+)\./);
+          if (match) {
+            return {
+              fileId: file.id,
+              fileName: file.name,
+              studentName: match[1].replace(/_/g, ' '),
+              rollNo: match[2],
+              uploadedAt: file.createdTime,
+              paperName: paper.name,
+              source: 'drive'
+            };
+          }
+          return null;
+        })
+        .filter(Boolean);
+      
+      pendingSubmissions = pendingFromDrive;
+    } catch (driveError) {
+      console.error('⚠️ Google Drive error (continuing with database only):', driveError.message);
+    }
+    
+    // Also get pending submissions from database
+    try {
+      const pendingFromDB = await prisma.studentSubmission.findMany({
+        where: {
+          paperId: paperId,
+          evaluationStatus: 'pending'
+        },
+        orderBy: { submittedAt: 'desc' }
+      });
+      
+      // Convert database submissions to the same format, but filter out duplicates
+      const pendingFromDatabase = pendingFromDB
+        .filter(submission => {
+          // Check if this submission already exists in Google Drive PENDING_ files
+          const existsInDrive = pendingSubmissions.some(driveSubmission => 
+            driveSubmission.studentName === submission.studentName && 
+            driveSubmission.rollNo === submission.rollNo
+          );
+          return !existsInDrive; // Only include if not already in Google Drive
+        })
+        .map(submission => ({
+          submissionId: submission.id,
+          fileName: `DB_Submission_${submission.id}`,
+          studentName: submission.studentName,
+          rollNo: submission.rollNo,
+          uploadedAt: submission.submittedAt.toISOString(),
+          paperName: paper.name,
+          source: 'database',
+          imageUrl: submission.imageUrl
+        }));
+      
+      // Combine both sources
+      pendingSubmissions = [...pendingSubmissions, ...pendingFromDatabase];
+    } catch (dbError) {
+      console.error('⚠️ Database error:', dbError.message);
+    }
+    
+    // Sort by uploaded date
+    pendingSubmissions.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+    
+    res.json({
+      paperId: paperId,
+      paperName: paper.name,
+      count: pendingSubmissions.length,
+      pendingSubmissions: pendingSubmissions
+    });
+    
+  } catch (error) {
+    console.error('Error fetching pending files:', error);
+    res.status(500).json({ error: 'Failed to fetch pending files' });
+  }
+});
+
+// Evaluate a PENDING_ file (new workflow)
+router.post('/evaluate-pending', async (req, res) => {
+  try {
+    const { fileId, fileName, studentName, rollNo, paperId, submissionId, source } = req.body;
+    
+    if (!studentName || !rollNo || !paperId) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    console.log(`🎓 Starting evaluation for ${source || 'PENDING'} file: ${fileName || submissionId}`);
+    
+    // Get paper and questions
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(paperId) }
+    });
+    
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+    
+    const questions = await prisma.question.findMany({
+      where: { paperId: parseInt(paperId) },
+      orderBy: { questionNumber: 'asc' }
+    });
+    
+    // Check if submission already exists for this student and paper
+    let existingSubmission = await prisma.studentSubmission.findFirst({
+      where: {
+        paperId: parseInt(paperId),
+        rollNo: rollNo,
+        studentName: studentName
+      }
+    });
+    
+    if (existingSubmission && existingSubmission.evaluationStatus === 'evaluated') {
+      return res.status(400).json({ error: 'Student already has an evaluated submission for this paper' });
+    }
+    
+    let imageBuffer;
+    
+    // Handle different sources
+    if (source === 'database' && submissionId) {
+      // Get submission from database
+      const dbSubmission = await prisma.studentSubmission.findUnique({
+        where: { id: parseInt(submissionId) }
+      });
+      
+      if (!dbSubmission) {
+        return res.status(404).json({ error: 'Database submission not found' });
+      }
+      
+      // Download image from Google Drive using the stored URL
+      console.log(`📄 Downloading file from database submission: ${dbSubmission.imageUrl}`);
+      imageBuffer = await googleDriveService.downloadImage(dbSubmission.imageUrl);
+      existingSubmission = dbSubmission;
+    } else {
+      // Handle Google Drive PENDING_ file
+      if (!fileId) {
+        return res.status(400).json({ error: 'Missing fileId for Google Drive file' });
+      }
+      
+      console.log(`📄 Downloading file from Google Drive: ${fileName}`);
+      imageBuffer = await googleDriveService.downloadImage(fileId);
+    }
+    
+    // Extract roll number from paper for validation
+    console.log('🔍 Extracting roll number from question paper...');
+    let rollNoFromPaper = null;
+    
+    try {
+      const rollNoResult = await geminiService.extractRollNumberFromImage(imageBuffer);
+      if (rollNoResult.success) {
+        rollNoFromPaper = rollNoResult.rollNumber;
+        console.log(`📋 Roll number from paper: ${rollNoFromPaper}`);
+      }
+    } catch (rollError) {
+      console.error('⚠️ Roll number extraction failed:', rollError.message);
+      // Continue without roll number validation
+    }
+    
+    // Validate roll number
+    if (rollNoFromPaper && rollNoFromPaper !== rollNo) {
+      console.log(`❌ Roll number mismatch: Paper shows ${rollNoFromPaper}, but file indicates ${rollNo}`);
+      
+      return res.status(400).json({ 
+        error: 'Roll number mismatch',
+        message: `The roll number in the question paper (${rollNoFromPaper}) does not match the roll number in the file name (${rollNo})`,
+        paperRollNo: rollNoFromPaper,
+        fileRollNo: rollNo
+      });
+    }
+    
+    // Extract answers using Gemini
+    console.log('🤖 Extracting answers using Gemini...');
+    let allStudentAnswers = [];
+    
+    // Process based on question type
+    const questionType = paper.questionType || 'traditional';
+    
+    if (questionType === 'omr' || questionType === 'mixed') {
+      // Use OMR detection
+      const omrResult = await omrService.detectOMRAnswers(imageBuffer, questions);
+      if (omrResult && omrResult.detected_answers) {
+        allStudentAnswers = omrResult.detected_answers;
+      }
+    }
+    
+    if (allStudentAnswers.length === 0) {
+      // Fall back to traditional Gemini extraction
+      const geminiResult = await geminiService.extractStudentAnswersFromBuffer(imageBuffer);
+      if (geminiResult.success) {
+        allStudentAnswers = geminiResult.answers;
+      }
+    }
+    
+    // Evaluate answers
+    console.log('📊 Evaluating answers...');
+    console.log('🔍 Debug - Questions structure:', questions.map(q => ({ 
+      question_number: q.questionNumber, 
+      correct_options: q.correctOptions 
+    })));
+    console.log('🔍 Debug - Student answers:', allStudentAnswers);
+    
+    const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', 'gemini_vision');
+    console.log('🔍 Debug - Evaluation result:', evaluationResult);
+    
+    // Create or update submission in database
+    const submissionData = {
+      paperId: parseInt(paperId),
+      studentName: studentName,
+      rollNo: rollNo,
+      score: evaluationResult.score,
+      totalQuestions: evaluationResult.totalQuestions,
+      percentage: evaluationResult.percentage,
+      evaluationStatus: 'evaluated',
+      evaluationMethod: 'pending_file_evaluation',
+      imageUrl: source === 'database' ? existingSubmission.imageUrl : fileId,
+      answerTypes: evaluationResult.answerTypes || {},
+      submittedAt: existingSubmission ? existingSubmission.submittedAt : new Date()
+    };
+    
+    let submission;
+    await prisma.$transaction(async (tx) => {
+      if (existingSubmission) {
+        // Update existing submission
+        submission = await tx.studentSubmission.update({
+          where: { id: existingSubmission.id },
+          data: submissionData
+        });
+        
+        // Delete old answers
+        await tx.studentAnswer.deleteMany({
+          where: { submissionId: existingSubmission.id }
+        });
+      } else {
+        // Create new submission
+        submission = await tx.studentSubmission.create({
+          data: submissionData
+        });
+      }
+      
+      // Store individual answers
+      if (evaluationResult.results && evaluationResult.results.length > 0) {
+        for (const result of evaluationResult.results) {
+          await tx.studentAnswer.create({
+            data: {
+              submissionId: submission.id,
+              questionNumber: result.questionNumber || 0,
+              selectedOption: result.selectedOption || result.studentOption || '',
+              selectedOptions: result.selectedOptions && result.selectedOptions.length > 0 
+                ? result.selectedOptions.filter(opt => opt !== undefined && opt !== null)
+                : result.selectedOption 
+                  ? [result.selectedOption] 
+                  : [''],
+              isCorrect: result.isCorrect || false,
+              textAnswer: result.textAnswer || '',
+              answerType: result.answerType || 'mcq'
+            }
+          });
+        }
+      }
+    });
+    
+    // Rename file from PENDING_ to final format (only for Google Drive files)
+    if (source !== 'database' && fileId) {
+      try {
+        const finalFileName = `${studentName}_Roll_${rollNo}_${paper.name}_evaluated.jpg`;
+        await googleDriveService.renameFile(fileId, finalFileName);
+        console.log(`📝 Renamed file to: ${finalFileName}`);
+      } catch (renameError) {
+        console.error('⚠️ Failed to rename file:', renameError);
+        // Don't fail the evaluation if renaming fails
+      }
+    }
+    
+    console.log(`✅ Evaluation completed for ${studentName} (Roll: ${rollNo})`);
+    console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
+    
+    res.json({
+      success: true,
+      message: 'Evaluation completed successfully',
+      submissionId: submission.id,
+      studentName: studentName,
+      rollNo: rollNo,
+      score: evaluationResult.score,
+      totalQuestions: evaluationResult.totalQuestions,
+      percentage: evaluationResult.percentage,
+      evaluationStatus: 'evaluated',
+      fileName: fileName || `DB_Submission_${submissionId}`
+    });
+    
+  } catch (error) {
+    console.error('❌ PENDING file evaluation error:', error);
+    res.status(500).json({ 
+      error: 'Failed to evaluate pending file: ' + error.message 
+    });
+  }
+});
+
+// Debug endpoint: Reset submission to pending status for testing
+router.post('/reset-to-pending/:submissionId', async (req, res) => {
+  try {
+    const submissionId = parseInt(req.params.submissionId);
+    
+    await prisma.studentSubmission.update({
+      where: { id: submissionId },
+      data: {
+        evaluationStatus: 'pending',
+        score: 0,
+        totalQuestions: 0,
+        percentage: 0
+      }
+    });
+    
+    // Delete existing answers
+    await prisma.studentAnswer.deleteMany({
+      where: { submissionId: submissionId }
+    });
+    
+    res.json({ success: true, message: 'Submission reset to pending status' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 

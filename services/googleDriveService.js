@@ -60,6 +60,34 @@ class GoogleDriveService {
     }
   }
 
+  async ensureValidToken() {
+    try {
+      // Test current token with a simple API call
+      if (!this.accessToken) {
+        throw new Error('No access token available');
+      }
+
+      const testResponse = await fetch('https://www.googleapis.com/drive/v3/about?fields=user', {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (testResponse.status === 401) {
+        console.log('🔑 Access token expired, refreshing...');
+        await this.refreshAccessToken();
+      } else if (!testResponse.ok) {
+        throw new Error(`Token validation failed: ${testResponse.status}`);
+      } else {
+        console.log('✅ Access token is valid');
+      }
+    } catch (error) {
+      console.log('🔑 Token validation failed, attempting refresh...');
+      await this.refreshAccessToken();
+    }
+  }
+
   async makeAuthenticatedRequest(url, options, retryOnAuth = true) {
     try {
       console.log(`🌐 Making request to: ${url.substring(0, 80)}...`);
@@ -111,19 +139,20 @@ class GoogleDriveService {
     }
   }
 
-  async uploadTempAnswerSheet(imageBuffer, originalFileName, studentName) {
+  async uploadTempAnswerSheet(imageBuffer, originalFileName, studentName, rollNo = '') {
     if (!this.accessToken) {
       throw new Error('Google Drive access token not configured');
     }
 
     try {
-      // Create temporary filename
-      const timestamp = Date.now();
-      // Safely handle studentName - use 'anonymous' if undefined or null
+      // Create temporary filename with PENDING_ format
+      // Safely handle studentName and rollNo - use defaults if undefined or null
       const safeName = studentName || 'anonymous';
+      const safeRollNo = rollNo || 'unknown';
       const sanitizedStudentName = safeName.replace(/[^a-zA-Z0-9]/g, '_');
+      const sanitizedRollNo = safeRollNo.replace(/[^a-zA-Z0-9]/g, '_');
       const fileExtension = path.extname(originalFileName) || '.jpg';
-      const tempFileName = `TEMP_${sanitizedStudentName}_${timestamp}${fileExtension}`;
+      const tempFileName = `PENDING_${sanitizedStudentName}_Roll_${sanitizedRollNo}${fileExtension}`;
 
       console.log(`📤 Uploading temporary file to Google Drive: ${tempFileName}`);
       console.log(`📊 Upload details: File size: ${imageBuffer.length} bytes, Folder ID: ${this.folderId}`);
@@ -541,6 +570,105 @@ class GoogleDriveService {
       console.error('❌ Error uploading final answer sheet to Google Drive:', error.message);
       throw new Error('Failed to upload final answer sheet to Google Drive: ' + error.message);
     }
+  }
+
+  // List all files with PENDING_ prefix
+  async listPendingFiles() {
+    try {
+      console.log('📋 Fetching PENDING_ files from Google Drive...');
+      
+      await this.ensureValidToken();
+      
+      // Query for files starting with PENDING_
+      const query = `name contains 'PENDING_' and parents in '${this.folderId}' and trashed=false`;
+      const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,createdTime,size)&orderBy=createdTime desc`;
+      
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to list PENDING files: ${response.status} ${errorText}`);
+      }
+
+      const data = await response.json();
+      console.log(`📋 Found ${data.files.length} PENDING_ files`);
+      
+      return data.files;
+      
+    } catch (error) {
+      console.error('❌ Error listing PENDING files from Google Drive:', error.message);
+      throw new Error('Failed to list PENDING files: ' + error.message);
+    }
+  }
+
+  // Download file from Google Drive by file ID
+  // Helper method to extract file ID from Google Drive URL
+  extractFileIdFromUrl(urlOrId) {
+    // If it's already a file ID (no slashes or protocol), return as is
+    if (!urlOrId.includes('/') && !urlOrId.includes('http')) {
+      return urlOrId;
+    }
+    
+    // Extract file ID from various Google Drive URL formats
+    const patterns = [
+      /\/file\/d\/([a-zA-Z0-9-_]+)/,  // /file/d/FILE_ID
+      /id=([a-zA-Z0-9-_]+)/,         // ?id=FILE_ID
+      /\/([a-zA-Z0-9-_]+)\/view/,    // /FILE_ID/view
+    ];
+    
+    for (const pattern of patterns) {
+      const match = urlOrId.match(pattern);
+      if (match) {
+        return match[1];
+      }
+    }
+    
+    // If no pattern matches, assume it's already a file ID
+    return urlOrId;
+  }
+
+  async downloadImage(fileIdOrUrl) {
+    try {
+      // Extract file ID from URL if needed
+      const fileId = this.extractFileIdFromUrl(fileIdOrUrl);
+      console.log(`📥 Downloading file from Google Drive: ${fileId}`);
+      
+      await this.ensureValidToken();
+      
+      const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+      
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`
+        }
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to download file: ${response.status} ${errorText}`);
+      }
+
+      // Return the file as a buffer
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      
+      console.log(`✅ Downloaded file successfully, size: ${buffer.length} bytes`);
+      return buffer;
+      
+    } catch (error) {
+      console.error('❌ Error downloading file from Google Drive:', error.message);
+      throw new Error('Failed to download file: ' + error.message);
+    }
+  }
+
+  // Rename file using existing renameFileInDrive method
+  async renameFile(fileId, newFileName) {
+    return this.renameFileInDrive(fileId, newFileName);
   }
 }
 
