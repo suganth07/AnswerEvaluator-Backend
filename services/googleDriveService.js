@@ -145,14 +145,8 @@ class GoogleDriveService {
     }
 
     try {
-      // Create temporary filename with PENDING_ format
-      // Safely handle studentName and rollNo - use defaults if undefined or null
-      const safeName = studentName || 'anonymous';
-      const safeRollNo = rollNo || 'unknown';
-      const sanitizedStudentName = safeName.replace(/[^a-zA-Z0-9]/g, '_');
-      const sanitizedRollNo = safeRollNo.replace(/[^a-zA-Z0-9]/g, '_');
-      const fileExtension = path.extname(originalFileName) || '.jpg';
-      const tempFileName = `PENDING_${sanitizedStudentName}_Roll_${sanitizedRollNo}${fileExtension}`;
+      // Use the originalFileName as provided by the caller (already in correct format)
+      const tempFileName = originalFileName;
 
       console.log(`📤 Uploading temporary file to Google Drive: ${tempFileName}`);
       console.log(`📊 Upload details: File size: ${imageBuffer.length} bytes, Folder ID: ${this.folderId}`);
@@ -572,15 +566,15 @@ class GoogleDriveService {
     }
   }
 
-  // List all files with PENDING_ prefix
+  // List all files with pending_ prefix
   async listPendingFiles() {
     try {
-      console.log('📋 Fetching PENDING_ files from Google Drive...');
+      console.log('📋 Fetching pending_ files from Google Drive...');
       
       await this.ensureValidToken();
       
-      // Query for files starting with PENDING_
-      const query = `name contains 'PENDING_' and parents in '${this.folderId}' and trashed=false`;
+      // Query for files starting with pending_
+      const query = `name contains 'pending_' and parents in '${this.folderId}' and trashed=false`;
       const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,createdTime,size)&orderBy=createdTime desc`;
       
       const response = await fetch(url, {
@@ -596,13 +590,13 @@ class GoogleDriveService {
       }
 
       const data = await response.json();
-      console.log(`📋 Found ${data.files.length} PENDING_ files`);
+      console.log(`📋 Found ${data.files.length} pending_ files`);
       
       return data.files;
       
     } catch (error) {
-      console.error('❌ Error listing PENDING files from Google Drive:', error.message);
-      throw new Error('Failed to list PENDING files: ' + error.message);
+      console.error('❌ Error listing pending files from Google Drive:', error.message);
+      throw new Error('Failed to list pending files: ' + error.message);
     }
   }
 

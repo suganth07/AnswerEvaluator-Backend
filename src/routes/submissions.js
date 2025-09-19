@@ -225,14 +225,21 @@ router.post('/submit', uploadAnswer, async (req, res) => {
 
     // Check if paper exists and get its page count and question type
     const paper = await prisma.paper.findUnique({
-      where: { id: parseInt(paperId) }
+      where: { id: parseInt(paperId) },
+      include: {
+        questions: {
+          select: { pageNumber: true }
+        }
+      }
     });
     
     if (!paper) {
       return res.status(404).json({ error: 'Paper not found' });
     }
     
-    const expectedPages = paper.totalPages || 1;
+    // Calculate actual page count from questions
+    const pageNumbers = paper.questions.map(q => q.pageNumber).filter(Boolean);
+    const expectedPages = pageNumbers.length > 0 ? Math.max(...pageNumbers) : 1;
     const questionType = paper.questionType || 'traditional';
     
     console.log(`📋 Paper info: ${paper.name} (${questionType} type, ${expectedPages} pages)`);
@@ -254,7 +261,11 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const pageNumber = i + 1;
-        const fileName = `${studentName}_${rollNo}_page${pageNumber}.png`;
+        // Use exact format: {pending}_{name}_{rollno}_{testname}_{pageno}.png
+        const cleanName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
+        const cleanRollNo = rollNo.replace(/[^a-zA-Z0-9]/g, '_');
+        const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+        const fileName = `pending_${cleanName}_${cleanRollNo}_${cleanTestName}_${pageNumber}.png`;
         
         console.log(`📤 Uploading page ${pageNumber}: ${fileName}`);
         
@@ -682,14 +693,17 @@ router.get('/pending-files/:paperId', async (req, res) => {
       // Parse file names to extract student info
       const pendingFromDrive = pendingFiles
         .map(file => {
-          // Extract info from PENDING_{name}_Roll_{rollno}.* format
-          const match = file.name.match(/^PENDING_(.+)_Roll_(\w+)\./);
+          // Extract info from pending_{name}_{rollno}_{testname}_{pageno}.png format
+          const match = file.name.match(/^pending_(.+?)_(.+?)_(.+?)_(\d+)\.png$/i);
           if (match) {
+            const [, name, rollNo, testName, pageNo] = match;
             return {
               fileId: file.id,
               fileName: file.name,
-              studentName: match[1].replace(/_/g, ' '),
-              rollNo: match[2],
+              studentName: name.replace(/_/g, ' '),
+              rollNo: rollNo.replace(/_/g, ' '),
+              testName: testName.replace(/_/g, ' '),
+              pageNumber: parseInt(pageNo),
               uploadedAt: file.createdTime,
               paperName: paper.name,
               source: 'drive'
@@ -987,7 +1001,17 @@ router.post('/evaluate-pending', async (req, res) => {
         const total = evaluationResult.totalQuestions;
         const percentage = Math.round(evaluationResult.percentage);
         
-        const finalFileName = `${cleanStudentName}_Roll_${cleanRollNo}_${cleanPaperName}_Score_${score}_of_${total}_${percentage}percent_evaluated.jpg`;
+        // Extract page number from the original filename if it exists
+        let pageNumber = '1'; // default page
+        if (fileName) {
+          const pageMatch = fileName.match(/pending_.+_.+_.+_(\d+)\.png$/i);
+          if (pageMatch) {
+            pageNumber = pageMatch[1];
+          }
+        }
+        
+        // Use exact format: {evaluated}_{name}_{rollno}_{testname}_{pageno}_{score%}.png
+        const finalFileName = `evaluated_${cleanStudentName}_${cleanRollNo}_${cleanPaperName}_${pageNumber}_${percentage}%.png`;
         console.log(`📝 Final filename: ${finalFileName}`);
         
         await googleDriveService.renameFile(fileId, finalFileName);
@@ -996,7 +1020,7 @@ router.post('/evaluate-pending', async (req, res) => {
         console.error('❌ Failed to rename file:', renameError);
         console.error('❌ Rename error details:', {
           source,
-          fileId,
+           fileId,
           studentName,
           rollNo,
           paperName: paper.name,

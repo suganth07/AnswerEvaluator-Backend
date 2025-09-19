@@ -58,7 +58,11 @@ router.get('/', verifyToken, async (req, res) => {
   try {
     const papers = await prisma.paper.findMany({
       include: {
-        questions: true,
+        questions: {
+          select: {
+            pageNumber: true
+          }
+        },
         _count: {
           select: { questions: true }
         }
@@ -68,10 +72,18 @@ router.get('/', verifyToken, async (req, res) => {
       }
     });
     
-    const papersWithCount = papers.map(paper => ({
-      ...paper,
-      question_count: paper._count.questions
-    }));
+    const papersWithCount = papers.map(paper => {
+      // Calculate actual page count from questions
+      const pageNumbers = paper.questions.map(q => q.pageNumber).filter(Boolean);
+      const actualPageCount = pageNumbers.length > 0 ? Math.max(...pageNumbers) : 1;
+      
+      return {
+        ...paper,
+        totalPages: actualPageCount, // Update with calculated page count
+        total_pages: actualPageCount, // Add snake_case version for frontend compatibility
+        question_count: paper._count.questions
+      };
+    });
     
     res.json(papersWithCount);
   } catch (error) {
@@ -92,6 +104,11 @@ router.get('/public', async (req, res) => {
         questionType: true,
         _count: {
           select: { questions: true }
+        },
+        questions: {
+          select: {
+            pageNumber: true
+          }
         }
       },
       orderBy: {
@@ -99,10 +116,21 @@ router.get('/public', async (req, res) => {
       }
     });
     
-    const papersWithCount = papers.map(paper => ({
-      ...paper,
-      question_count: paper._count.questions
-    }));
+    const papersWithCount = papers.map(paper => {
+      // Calculate actual page count from questions
+      const pageNumbers = paper.questions.map(q => q.pageNumber).filter(Boolean);
+      const actualPageCount = pageNumbers.length > 0 ? Math.max(...pageNumbers) : 1;
+      
+      return {
+        id: paper.id,
+        name: paper.name,
+        uploadedAt: paper.uploadedAt,
+        totalPages: actualPageCount, // Use calculated page count
+        total_pages: actualPageCount, // Add snake_case version for frontend compatibility
+        questionType: paper.questionType,
+        question_count: paper._count.questions
+      };
+    });
     
     res.json(papersWithCount);
   } catch (error) {
