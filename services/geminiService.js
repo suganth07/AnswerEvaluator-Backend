@@ -407,6 +407,12 @@ class GeminiService {
     }
 
     getMimeType(filePath) {
+        // Handle case where filePath might not be a string (e.g., Buffer object)
+        if (typeof filePath !== 'string') {
+            console.warn('⚠️ getMimeType received non-string input:', typeof filePath);
+            return 'image/jpeg'; // Default fallback
+        }
+        
         const ext = filePath.toLowerCase().split('.').pop();
         switch (ext) {
             case 'jpg':
@@ -432,7 +438,7 @@ class GeminiService {
                 const imagePart = {
                     inlineData: {
                         data: imageBuffer.toString('base64'),
-                        mimeType: this.getMimeType(imageBuffer)
+                        mimeType: 'image/jpeg' // Default mime type for buffer images
                     }
                 };
 

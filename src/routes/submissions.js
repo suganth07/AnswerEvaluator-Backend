@@ -738,6 +738,24 @@ router.get('/pending-files/:paperId', async (req, res) => {
   }
 });
 
+// Helper function to retry database operations
+const retryDatabaseOperation = async (operation, maxRetries = 3, delay = 1000) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.error(`❌ Database operation attempt ${attempt} failed:`, error.message);
+      
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      
+      // Wait before retrying, with exponential backoff
+      await new Promise(resolve => setTimeout(resolve, delay * attempt));
+    }
+  }
+};
+
 // Evaluate a PENDING_ file (new workflow)
 router.post('/evaluate-pending', async (req, res) => {
   try {
@@ -880,46 +898,60 @@ router.post('/evaluate-pending', async (req, res) => {
     };
     
     let submission;
-    await prisma.$transaction(async (tx) => {
-      if (existingSubmission) {
-        // Update existing submission
-        submission = await tx.studentSubmission.update({
-          where: { id: existingSubmission.id },
-          data: submissionData
-        });
-        
-        // Delete old answers
-        await tx.studentAnswer.deleteMany({
-          where: { submissionId: existingSubmission.id }
-        });
-      } else {
-        // Create new submission
-        submission = await tx.studentSubmission.create({
-          data: submissionData
-        });
-      }
-      
-      // Store individual answers
-      if (evaluationResult.results && evaluationResult.results.length > 0) {
-        for (const result of evaluationResult.results) {
-          await tx.studentAnswer.create({
-            data: {
-              submissionId: submission.id,
+    try {
+      submission = await retryDatabaseOperation(async () => {
+        return await prisma.$transaction(async (tx) => {
+          let txSubmission;
+          
+          if (existingSubmission) {
+            // Update existing submission
+            txSubmission = await tx.studentSubmission.update({
+              where: { id: existingSubmission.id },
+              data: submissionData
+            });
+            
+            // Delete old answers
+            await tx.studentAnswer.deleteMany({
+              where: { submissionId: existingSubmission.id }
+            });
+          } else {
+            // Create new submission
+            txSubmission = await tx.studentSubmission.create({
+              data: submissionData
+            });
+          }
+          
+          // Store individual answers in batch
+          if (evaluationResult.results && evaluationResult.results.length > 0) {
+            const answerData = evaluationResult.results.map(result => ({
+              submissionId: txSubmission.id,
               questionNumber: result.questionNumber || 0,
               selectedOption: result.selectedOption || result.studentOption || '',
               selectedOptions: result.selectedOptions && result.selectedOptions.length > 0 
-                ? result.selectedOptions.filter(opt => opt !== undefined && opt !== null)
-                : result.selectedOption 
-                  ? [result.selectedOption] 
-                  : [''],
+                ? result.selectedOptions 
+                : [result.selectedOption || result.studentOption || ''],
               isCorrect: result.isCorrect || false,
-              textAnswer: result.textAnswer || '',
-              answerType: result.answerType || 'mcq'
-            }
-          });
-        }
-      }
-    });
+              textAnswer: result.textAnswer || null,
+              blankAnswers: result.blankAnswers || {},
+              answerType: result.answerType || 'multiple_choice'
+            }));
+            
+            // Use createMany for better performance
+            await tx.studentAnswer.createMany({
+              data: answerData
+            });
+          }
+          
+          return txSubmission;
+        }, {
+          timeout: 30000, // 30 seconds timeout
+          maxWait: 5000   // 5 seconds max wait for transaction to start
+        });
+      }, 3, 2000); // 3 retries with 2 second delay
+    } catch (transactionError) {
+      console.error('❌ PENDING file evaluation transaction error:', transactionError);
+      throw new Error(`Database transaction failed: ${transactionError.message}`);
+    }
     
     // Rename file from PENDING_ to final format (only for Google Drive files)
     if (source !== 'database' && fileId) {
@@ -951,8 +983,31 @@ router.post('/evaluate-pending', async (req, res) => {
     
   } catch (error) {
     console.error('❌ PENDING file evaluation error:', error);
-    res.status(500).json({ 
-      error: 'Failed to evaluate pending file: ' + error.message 
+    
+    // Provide more specific error messages based on error type
+    let errorMessage = 'Failed to evaluate pending file';
+    let statusCode = 500;
+    
+    if (error.message.includes('Transaction not found')) {
+      errorMessage = 'Database transaction timeout. Please try again.';
+      statusCode = 408; // Request Timeout
+    } else if (error.message.includes('toLowerCase is not a function')) {
+      errorMessage = 'File processing error. Invalid file format.';
+      statusCode = 400; // Bad Request
+    } else if (error.message.includes('Roll number')) {
+      errorMessage = 'Could not extract roll number from submission.';
+      statusCode = 422; // Unprocessable Entity
+    } else if (error.message.includes('Gemini')) {
+      errorMessage = 'AI evaluation service error. Please try again.';
+      statusCode = 503; // Service Unavailable
+    } else if (error.message.includes('Database transaction failed')) {
+      errorMessage = 'Database operation failed. Please try again.';
+      statusCode = 503; // Service Unavailable
+    }
+    
+    res.status(statusCode).json({ 
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
