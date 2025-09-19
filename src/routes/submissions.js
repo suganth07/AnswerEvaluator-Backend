@@ -572,10 +572,29 @@ router.get('/paper/:paperId/status/:status', async (req, res) => {
       orderBy: { submittedAt: 'desc' }
     });
 
+    // Transform the data to ensure proper types and consistent field names
+    const transformedSubmissions = submissions.map(submission => ({
+      id: submission.id,
+      paperId: submission.paperId,
+      studentName: submission.studentName,
+      rollNo: submission.rollNo,
+      imageUrl: submission.imageUrl,
+      score: parseFloat(submission.score.toString()), // Convert Decimal to number
+      totalQuestions: submission.totalQuestions,
+      percentage: parseFloat(submission.percentage.toString()), // Convert Decimal to number
+      submittedAt: submission.submittedAt,
+      evaluationStatus: submission.evaluationStatus,
+      evaluationMethod: submission.evaluationMethod,
+      paperName: submission.paper.name
+    }));
+
+    console.log(`📊 Returning ${transformedSubmissions.length} evaluated submissions for paper ${paperId}`);
+    console.log('Sample submission data:', transformedSubmissions[0] || 'No submissions');
+
     res.json({
       status: status,
-      count: submissions.length,
-      submissions: submissions
+      count: transformedSubmissions.length,
+      submissions: transformedSubmissions
     });
   } catch (error) {
     console.error('Error fetching submissions by status:', error);
@@ -954,15 +973,39 @@ router.post('/evaluate-pending', async (req, res) => {
     }
     
     // Rename file from PENDING_ to final format (only for Google Drive files)
+    console.log(`🔍 Rename check - Source: ${source}, FileId: ${fileId}, Source check: ${source !== 'database'}, FileId check: ${!!fileId}`);
     if (source !== 'database' && fileId) {
       try {
-        const finalFileName = `${studentName}_Roll_${rollNo}_${paper.name}_evaluated.jpg`;
+        console.log(`🔄 Attempting to rename file - Source: ${source}, FileId: ${fileId}`);
+        console.log(`📝 Student: ${studentName}, Roll: ${rollNo}, Paper: ${paper.name}`);
+        
+        // Clean up the filename to avoid special characters
+        const cleanStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
+        const cleanRollNo = rollNo.replace(/[^a-zA-Z0-9]/g, '_');
+        const cleanPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+        const score = evaluationResult.score;
+        const total = evaluationResult.totalQuestions;
+        const percentage = Math.round(evaluationResult.percentage);
+        
+        const finalFileName = `${cleanStudentName}_Roll_${cleanRollNo}_${cleanPaperName}_Score_${score}_of_${total}_${percentage}percent_evaluated.jpg`;
+        console.log(`📝 Final filename: ${finalFileName}`);
+        
         await googleDriveService.renameFile(fileId, finalFileName);
-        console.log(`📝 Renamed file to: ${finalFileName}`);
+        console.log(`✅ Successfully renamed file to: ${finalFileName}`);
       } catch (renameError) {
-        console.error('⚠️ Failed to rename file:', renameError);
+        console.error('❌ Failed to rename file:', renameError);
+        console.error('❌ Rename error details:', {
+          source,
+          fileId,
+          studentName,
+          rollNo,
+          paperName: paper.name,
+          error: renameError.message
+        });
         // Don't fail the evaluation if renaming fails
       }
+    } else {
+      console.log(`ℹ️ Skipping file rename - Source: ${source}, FileId: ${fileId}`);
     }
     
     console.log(`✅ Evaluation completed for ${studentName} (Roll: ${rollNo})`);
