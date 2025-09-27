@@ -13,8 +13,79 @@ router.post('/create-manual', async (req, res) => {
       return res.status(400).json({ error: 'Test name and questions are required' });
     }
 
-    // Use Prisma transaction
+    console.log(`🚀 Creating manual test: "${testName}" with ${questions.length} questions`);
+
+    // Prepare all question data first to minimize transaction time
+    const questionData = [];
+    
+    for (let i = 0; i < questions.length; i++) {
+      const question = questions[i];
+      
+      console.log(`📝 Preparing question ${question.questionNumber}: isMultipleChoice = ${question.isMultipleChoice}`);
+      
+      // Prepare question data
+      let correctOptions = [];
+      let options = {};
+      let weightages = {};
+
+      if (question.isMultipleChoice) {
+        // Build options object
+        if (question.options && Array.isArray(question.options)) {
+          question.options.forEach(opt => {
+            if (opt && opt.id && opt.text !== undefined) {
+              options[opt.id] = opt.text;
+              if (opt.isCorrect) {
+                correctOptions.push(opt.id);
+                // Handle weightage - allow 0 and decimal values
+                const weight = parseFloat(opt.weight);
+                if (!isNaN(weight) && weight >= 0) {
+                  weightages[opt.id] = weight;
+                } else {
+                  // Default to 1 if invalid weight
+                  weightages[opt.id] = 1;
+                }
+                console.log(`  Option ${opt.id}: weight = ${opt.weight} → parsed as ${weightages[opt.id]}`);
+              }
+            }
+          });
+        }
+      } else {
+        // For non-multiple choice questions, use singleCorrectAnswer
+        if (question.singleCorrectAnswer && question.singleCorrectAnswer.trim()) {
+          correctOptions = [question.singleCorrectAnswer.trim()];
+        }
+        
+        console.log(`🔍 Non-multiple choice question ${question.questionNumber}: singleCorrectAnswer = "${question.singleCorrectAnswer}"`);
+      }
+
+      // Ensure at least one correct answer
+      if (correctOptions.length === 0) {
+        throw new Error(`Question ${question.questionNumber}: Questions must have at least one correct answer`);
+      }
+
+      // Validate and parse total marks
+      const totalMarks = parseFloat(question.totalMarks);
+      const pointsPerBlank = !isNaN(totalMarks) && totalMarks >= 0 ? totalMarks : 1;
+      
+      console.log(`  Total marks: ${question.totalMarks} → parsed as ${pointsPerBlank}`);
+      console.log(`  Weightages: ${JSON.stringify(weightages)}`);
+
+      // Store prepared data
+      questionData.push({
+        questionNumber: question.questionNumber,
+        questionText: question.questionText || `Question ${question.questionNumber}`,
+        questionFormat: question.isMultipleChoice ? 'multiple_choice' : 'text',
+        options: options,
+        correctOptions: correctOptions,
+        pointsPerBlank: pointsPerBlank,
+        weightages: weightages
+      });
+    }
+
+    // Use optimized Prisma transaction with timeout
     const result = await prisma.$transaction(async (tx) => {
+      console.log(`🔄 Starting database transaction...`);
+      
       // Insert paper
       const paper = await tx.paper.create({
         data: {
@@ -25,75 +96,35 @@ router.post('/create-manual', async (req, res) => {
           adminId: 1
         }
       });
+      
+      console.log(`📄 Created paper: ${paper.id}`);
 
-      // Insert questions
-      for (let i = 0; i < questions.length; i++) {
-        const question = questions[i];
-        
-        console.log(`📝 Processing question ${question.questionNumber}: isMultipleChoice = ${question.isMultipleChoice}, hasOptions = ${question.options ? question.options.length : 0}, singleCorrectAnswer = "${question.singleCorrectAnswer}"`);
-        
-        // Prepare question data
-        let correctOptions = [];
-        let options = {};
-        let weightages = {};
+      // Batch insert questions
+      const questionsToInsert = questionData.map(qData => ({
+        paperId: paper.id,
+        ...qData
+      }));
 
-        if (question.isMultipleChoice) {
-          // Build options object
-          question.options.forEach(opt => {
-            options[opt.id] = opt.text;
-            if (opt.isCorrect) {
-              correctOptions.push(opt.id);
-              // Handle weightage - allow 0 and decimal values
-              const weight = parseFloat(opt.weight);
-              if (!isNaN(weight) && weight >= 0) {
-                weightages[opt.id] = weight;
-              } else {
-                // Default to 1 if invalid weight
-                weightages[opt.id] = 1;
-              }
-              console.log(`  Option ${opt.id}: weight = ${opt.weight} → parsed as ${weightages[opt.id]}`);
-            }
+      // Insert questions in smaller batches to avoid timeout
+      const batchSize = 5; // Process 5 questions at a time
+      for (let i = 0; i < questionsToInsert.length; i += batchSize) {
+        const batch = questionsToInsert.slice(i, i + batchSize);
+        
+        for (const questionInsert of batch) {
+          const questionResult = await tx.question.create({
+            data: questionInsert
           });
-        } else {
-          // For non-multiple choice questions, use singleCorrectAnswer
-          if (question.singleCorrectAnswer) {
-            correctOptions = [question.singleCorrectAnswer];
-          }
-          
-          console.log(`🔍 Non-multiple choice question ${question.questionNumber}: singleCorrectAnswer = "${question.singleCorrectAnswer}", stored as: ${JSON.stringify(correctOptions)}`);
+          console.log(`✅ Inserted question ${questionInsert.questionNumber}: ${questionResult.id}`);
         }
-
-        // Ensure at least one correct answer
-        if (correctOptions.length === 0) {
-          throw new Error(`Question ${question.questionNumber}: Questions must have at least one correct answer`);
-        }
-
-        // Validate and parse total marks
-        const totalMarks = parseFloat(question.totalMarks);
-        const pointsPerBlank = !isNaN(totalMarks) && totalMarks >= 0 ? totalMarks : 1;
-        
-        console.log(`  Total marks: ${question.totalMarks} → parsed as ${pointsPerBlank}`);
-        console.log(`  Weightages: ${JSON.stringify(weightages)}`);
-
-        // Insert question
-        const questionResult = await tx.question.create({
-          data: {
-            paperId: paper.id,
-            questionNumber: question.questionNumber,
-            questionText: question.questionText,
-            questionFormat: question.isMultipleChoice ? 'multiple_choice' : 'text',
-            options: options,
-            correctOptions: correctOptions,
-            pointsPerBlank: pointsPerBlank,
-            weightages: weightages
-          }
-        });
-
-        console.log(`✅ Inserted question ${question.questionNumber}: ${questionResult.id}`);
       }
 
+      console.log(`🎉 Transaction completed successfully`);
       return paper;
+    }, {
+      timeout: 30000, // 30 seconds timeout
     });
+    
+    console.log(`✅ Manual test created successfully: ${result.id}`);
     
     res.json({
       success: true,
@@ -103,7 +134,7 @@ router.post('/create-manual', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error creating manual test:', error);
+    console.error('❌ Error creating manual test:', error);
     res.status(500).json({ 
       error: 'Failed to create manual test',
       details: error.message 
