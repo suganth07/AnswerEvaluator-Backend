@@ -45,7 +45,10 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
       // Prepare questions for OMR evaluation
       const omrQuestions = correctAnswers.map(q => ({
         question_number: q.question_number,
-        correct_options: q.correct_options || ["A"]
+        correct_options: q.correct_options || ["A"],
+        weightages: q.weightages || {},
+        points_per_blank: q.points_per_blank || 1,
+        options: q.options || {} // ✅ ADDED: Include options mapping for label-to-content conversion
       }));
 
       // Convert student answers to OMR format
@@ -70,6 +73,7 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
           studentOption: result.student_answers.join(','),
           isCorrect: result.is_correct,
           partialScore: result.partial_score,
+          maxPoints: result.max_points || 1,
           details: result.evaluation_details
         }))
       };
@@ -79,7 +83,264 @@ const evaluateAnswers = (correctAnswers, studentAnswers, questionFormat = 'multi
     }
   }
 
+  // Use weightage-based evaluation for manual tests, traditional for others
+  if (evaluationMethod === 'manual_test' || (correctAnswers.length > 0 && correctAnswers[0].weightages)) {
+    return evaluateAnswersWithWeightages(correctAnswers, studentAnswers);
+  }
+
   // Traditional multiple choice evaluation (backward compatibility)
+  return evaluateAnswersTraditional(correctAnswers, studentAnswers);
+};
+
+// Helper function to convert option labels (A, B, C, D) to actual option text content
+function convertOptionLabelsToContent(studentOptionLabels, questionOptions) {
+  if (!questionOptions || typeof questionOptions !== 'object') {
+    return studentOptionLabels; // Return as-is if no options mapping available
+  }
+  
+  return studentOptionLabels.map(label => {
+    // First try exact match, then try case-insensitive match
+    let matchedKey = null;
+    
+    // Try exact match first
+    if (questionOptions[label]) {
+      matchedKey = label;
+    } else {
+      // Try case-insensitive match
+      matchedKey = Object.keys(questionOptions).find(key => 
+        key.toUpperCase() === label.toUpperCase()
+      );
+    }
+    
+    if (matchedKey && questionOptions[matchedKey]) {
+      return questionOptions[matchedKey].trim();
+    }
+    
+    // Otherwise, assume it's already the content (backward compatibility)
+    return label.trim();
+  });
+}
+
+// Helper function to detect if correctOptions contain option labels vs actual content  
+function isUsingOptionLabels(correctOptions, questionOptions) {
+  if (!correctOptions || !questionOptions || typeof questionOptions !== 'object') {
+    return false;
+  }
+  
+  // Check if any correct option matches an option key (A, B, C, D) - case insensitive
+  return correctOptions.some(option => {
+    return Object.keys(questionOptions).some(key => 
+      key.toUpperCase() === option.toUpperCase()
+    );
+  });
+}
+
+// Helper function to convert correct options from labels to content if needed
+function normalizeCorrectOptions(correctOptions, questionOptions) {
+  if (isUsingOptionLabels(correctOptions, questionOptions)) {
+    console.log(`🔄 Converting correct options from labels to content: [${correctOptions.join(',')}]`);
+    return convertOptionLabelsToContent(correctOptions, questionOptions);
+  }
+  return correctOptions; // Already using content format
+}
+
+// Helper function to normalize options for case-insensitive comparison
+function normalizeOptionsForComparison(options) {
+  return options.map(opt => opt.toString().trim().toLowerCase());
+}
+
+// New weightage-based evaluation function
+const evaluateAnswersWithWeightages = (correctAnswers, studentAnswers) => {
+  console.log('🎯 Using weightage-based evaluation');
+  
+  const totalQuestions = correctAnswers.length;
+  let totalScore = 0;
+  let maxPossibleScore = 0;
+  const answerResults = [];
+
+  console.log('🔍 Debug - Raw correctAnswers:', correctAnswers);
+  console.log('🔍 Debug - Raw studentAnswers:', studentAnswers);
+
+  // Create a map of correct answers for quick lookup
+  const correctAnswerMap = {};
+  correctAnswers.forEach(q => {
+    const questionNum = q.questionNumber || q.question_number;
+    const correctOptions = q.correctOptions || q.correct_options;
+    const weightages = q.weightages || {};
+    const maxPoints = q.pointsPerBlank || q.points_per_blank || 1;
+    const options = q.options || {}; // Include options mapping for conversion
+    
+    if (correctOptions && Array.isArray(correctOptions)) {
+      correctAnswerMap[questionNum] = {
+        correctOptions: correctOptions, // 🔄 REMOVED: Don't force uppercase - preserve actual content
+        weightages: weightages,
+        maxPoints: maxPoints,
+        options: options // ✅ ADDED: Include options mapping for label-to-content conversion
+      };
+    }
+    maxPossibleScore += maxPoints;
+  });
+
+  console.log('🔍 Debug - correctAnswerMap:', correctAnswerMap);
+
+  // Create a map of student answers for quick lookup
+  const studentAnswerMap = {};
+  studentAnswers.forEach(a => {
+    const questionNum = a.question || a.questionNumber;
+    
+    if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
+      studentAnswerMap[questionNum] = a.selectedOptions; // 🔄 REMOVED: Don't force uppercase - preserve for conversion
+    } else if (a.selectedOption) {
+      studentAnswerMap[questionNum] = [a.selectedOption]; // 🔄 REMOVED: Don't force uppercase - preserve for conversion
+    } else {
+      studentAnswerMap[questionNum] = [];
+    }
+  });
+
+  console.log('🔍 Debug - studentAnswerMap:', studentAnswerMap);
+
+  // Evaluate each question using the new weightage-based logic
+  for (const correctAnswer of correctAnswers) {
+    const questionNumber = correctAnswer.questionNumber || correctAnswer.question_number;
+    const questionData = correctAnswerMap[questionNumber];
+    let studentOptions = studentAnswerMap[questionNumber] || [];
+    
+    if (!questionData) {
+      console.warn(`⚠️ No question data found for question ${questionNumber}`);
+      continue;
+    }
+    
+    let { correctOptions, weightages, maxPoints, options } = questionData;
+    
+    console.log(`🔍 Debug - Q${questionNumber} [BEFORE]: Correct=[${correctOptions.join(',')}] Student=[${studentOptions.join(',')}]`);
+    
+    // 🔄 NORMALIZE OPTIONS: Convert both student answers and correct answers to same format
+    
+    // Step 1: Normalize correct options (convert labels to content if needed)
+    correctOptions = normalizeCorrectOptions(correctOptions, options);
+    
+    // Step 2: Convert student option labels to actual content
+    if (options && typeof options === 'object') {
+      studentOptions = convertOptionLabelsToContent(studentOptions, options);
+    }
+    
+    // Step 3: Normalize weightages to use content as keys (not labels)
+    let normalizedWeightages = {};
+    if (weightages && options) {
+      Object.keys(weightages).forEach(key => {
+        if (options[key]) {
+          // Convert label-based weightage to content-based
+          normalizedWeightages[options[key].trim()] = weightages[key];
+        } else {
+          // Already content-based or direct mapping
+          normalizedWeightages[key] = weightages[key];
+        }
+      });
+      weightages = normalizedWeightages;
+    }
+    
+    console.log(`🔍 Debug - Q${questionNumber} [AFTER]: Correct=[${correctOptions.join(',')}] Student=[${studentOptions.join(',')}] Weightages=${JSON.stringify(weightages)} MaxPoints=${maxPoints}`);
+    
+    // 🔄 CASE-INSENSITIVE COMPARISON: Normalize both sets for comparison
+    const normalizedCorrectOptions = normalizeOptionsForComparison(correctOptions);
+    const normalizedStudentOptions = normalizeOptionsForComparison(studentOptions);
+    
+    console.log(`🔍 Debug - Q${questionNumber} [NORMALIZED]: Correct=[${normalizedCorrectOptions.join(',')}] Student=[${normalizedStudentOptions.join(',')}]`);
+    
+    // NEW EVALUATION LOGIC: If any wrong option is selected, score is 0
+    const correctSet = new Set(normalizedCorrectOptions);
+    const studentSet = new Set(normalizedStudentOptions);
+    
+    // Check if any wrong option is selected
+    const wrongOptions = [...studentSet].filter(ans => !correctSet.has(ans));
+    let questionScore = 0;
+    let isCorrect = false;
+    let details = '';
+    
+    if (wrongOptions.length > 0) {
+      // Case 5: Any wrong option selected = 0 marks
+      questionScore = 0;
+      isCorrect = false;
+      details = `Wrong option(s) selected: ${wrongOptions.join(', ')}. No partial marking.`;
+      console.log(`🔍 Debug - Q${questionNumber}: Wrong options detected - score=0`);
+    } else if (studentOptions.length === 0) {
+      // No options selected
+      questionScore = 0;
+      isCorrect = false;
+      details = 'No options selected';
+      console.log(`🔍 Debug - Q${questionNumber}: No options selected - score=0`);
+    } else {
+      // Only correct options selected - calculate weightage sum
+      // Match original options with normalized ones for weightage calculation
+      const correctSelections = studentOptions.filter(studentOpt => {
+        const normalizedStudentOpt = studentOpt.toString().trim().toLowerCase();
+        return correctSet.has(normalizedStudentOpt);
+      });
+      
+      questionScore = correctSelections.reduce((sum, option) => {
+        // Try exact match first, then case-insensitive match for weightages
+        let weightageKey = option;
+        if (!weightages[option]) {
+          // Try to find case-insensitive match in weightages
+          const matchedKey = Object.keys(weightages).find(key => 
+            key.toLowerCase() === option.toLowerCase()
+          );
+          if (matchedKey) {
+            weightageKey = matchedKey;
+          }
+        }
+        return sum + (weightages[weightageKey] || 0);
+      }, 0);
+      
+      // Round to 2 decimal places
+      questionScore = Math.round(questionScore * 100) / 100;
+      
+      // Check if this is a perfect match
+      isCorrect = (correctSelections.length === correctOptions.length) && (questionScore === maxPoints);
+      
+      if (correctSelections.length === correctOptions.length) {
+        details = `All correct options selected. Score: ${questionScore}/${maxPoints}`;
+      } else {
+        details = `Partial correct options: ${correctSelections.join(', ')}. Score: ${questionScore}/${maxPoints}`;
+      }
+      
+      console.log(`🔍 Debug - Q${questionNumber}: Only correct options - score=${questionScore}/${maxPoints}`);
+    }
+    
+    totalScore += questionScore;
+
+    answerResults.push({
+      questionNumber,
+      correctOption: correctOptions.join(','),
+      studentOption: studentOptions.join(','),
+      isCorrect,
+      partialScore: questionScore,
+      maxPoints: maxPoints,
+      details: details,
+      weightageBreakdown: studentOptions.length > 0 && wrongOptions.length === 0 ? 
+        studentOptions.map(opt => ({ option: opt, weight: weightages[opt] || 0 })) : []
+    });
+  }
+
+  const percentage = maxPossibleScore > 0 ? (totalScore / maxPossibleScore) * 100 : 0;
+
+  console.log(`🔍 Debug - Final weightage evaluation: score=${totalScore}, maxPossible=${maxPossibleScore}, percentage=${percentage}`);
+
+  return {
+    score: totalScore,
+    totalQuestions,
+    maxPossibleScore,
+    percentage,
+    results: answerResults,
+    answerResults,
+    evaluationMethod: 'weightage_based'
+  };
+};
+
+// Traditional evaluation function (kept for backward compatibility)
+const evaluateAnswersTraditional = (correctAnswers, studentAnswers) => {
+  console.log('📚 Using traditional evaluation');
+  
   const totalQuestions = correctAnswers.length;
   let score = 0;
   const answerResults = [];
@@ -484,11 +745,19 @@ router.post('/evaluate/:submissionId', async (req, res) => {
     // Step 3: Evaluate answers
     console.log('📊 Evaluating answers...');
     
-    const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', 'gemini_vision');
+    // Detect if this is a manual test with weightages
+    const hasWeightages = questions.some(q => q.weightages && Object.keys(q.weightages).length > 0);
+    const evaluationMethod = hasWeightages ? 'manual_test' : 'gemini_vision';
+    
+    console.log(`🎯 Using evaluation method: ${evaluationMethod}${hasWeightages ? ' (weightage-based)' : ' (traditional)'}`);
+    
+    const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', evaluationMethod);
     
     // Step 4: Store results in database
     await prisma.$transaction(async (tx) => {
-      // Update submission
+      // Update submission with appropriate max score
+      const maxScore = evaluationResult.maxPossibleScore || evaluationResult.totalQuestions;
+      
       await tx.studentSubmission.update({
         where: { id: submissionId },
         data: {
@@ -496,23 +765,30 @@ router.post('/evaluate/:submissionId', async (req, res) => {
           totalQuestions: evaluationResult.totalQuestions,
           percentage: evaluationResult.percentage,
           evaluationStatus: 'evaluated',
-          evaluationMethod: 'admin_triggered',
+          evaluationMethod: `admin_triggered_${evaluationResult.evaluationMethod || 'traditional'}`,
           answerTypes: evaluationResult.answerTypes || {}
         }
       });
 
       // Store individual answers
       for (const result of evaluationResult.results) {
+        const answerData = {
+          submissionId: submissionId,
+          questionNumber: result.questionNumber,
+          selectedOption: result.selectedOption || (result.studentOption ? result.studentOption.split(',')[0] : null),
+          selectedOptions: result.selectedOptions || (result.studentOption ? result.studentOption.split(',') : []),
+          isCorrect: result.isCorrect,
+          textAnswer: result.textAnswer,
+          answerType: result.answerType || 'mcq'
+        };
+        
+        // Add weightage breakdown details if available
+        if (result.details) {
+          answerData.textAnswer = result.details;
+        }
+        
         await tx.studentAnswer.create({
-          data: {
-            submissionId: submissionId,
-            questionNumber: result.questionNumber,
-            selectedOption: result.selectedOption,
-            selectedOptions: result.selectedOptions || [result.selectedOption],
-            isCorrect: result.isCorrect,
-            textAnswer: result.textAnswer,
-            answerType: result.answerType || 'mcq'
-          }
+          data: answerData
         });
       }
     });
@@ -906,16 +1182,25 @@ router.post('/evaluate-pending', async (req, res) => {
     
     // Evaluate answers
     console.log('📊 Evaluating answers...');
+    
+    // Detect if this is a manual test with weightages
+    const hasWeightages = questions.some(q => q.weightages && Object.keys(q.weightages).length > 0);
+    const evaluationMethod = hasWeightages ? 'manual_test' : 'gemini_vision';
+    
+    console.log(`🎯 Using evaluation method: ${evaluationMethod}${hasWeightages ? ' (weightage-based)' : ' (traditional)'}`);
     console.log('🔍 Debug - Questions structure:', questions.map(q => ({ 
       question_number: q.questionNumber, 
-      correct_options: q.correctOptions 
+      correct_options: q.correctOptions,
+      weightages: q.weightages || {}
     })));
     console.log('🔍 Debug - Student answers:', allStudentAnswers);
     
-    const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', 'gemini_vision');
+    const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', evaluationMethod);
     console.log('🔍 Debug - Evaluation result:', evaluationResult);
     
     // Create or update submission in database
+    const maxScore = evaluationResult.maxPossibleScore || evaluationResult.totalQuestions;
+    
     const submissionData = {
       paperId: parseInt(paperId),
       studentName: studentName,
@@ -924,7 +1209,7 @@ router.post('/evaluate-pending', async (req, res) => {
       totalQuestions: evaluationResult.totalQuestions,
       percentage: evaluationResult.percentage,
       evaluationStatus: 'evaluated',
-      evaluationMethod: 'pending_file_evaluation',
+      evaluationMethod: `pending_file_${evaluationResult.evaluationMethod || 'traditional'}`,
       imageUrl: source === 'database' ? existingSubmission.imageUrl : fileId,
       answerTypes: evaluationResult.answerTypes || {},
       submittedAt: existingSubmission ? existingSubmission.submittedAt : new Date()
@@ -959,12 +1244,12 @@ router.post('/evaluate-pending', async (req, res) => {
             const answerData = evaluationResult.results.map(result => ({
               submissionId: txSubmission.id,
               questionNumber: result.questionNumber || 0,
-              selectedOption: result.selectedOption || result.studentOption || '',
+              selectedOption: result.selectedOption || (result.studentOption ? result.studentOption.split(',')[0] : ''),
               selectedOptions: result.selectedOptions && result.selectedOptions.length > 0 
                 ? result.selectedOptions 
-                : [result.selectedOption || result.studentOption || ''],
+                : (result.studentOption ? result.studentOption.split(',') : [result.selectedOption || '']),
               isCorrect: result.isCorrect || false,
-              textAnswer: result.textAnswer || null,
+              textAnswer: result.details || result.textAnswer || null,
               blankAnswers: result.blankAnswers || {},
               answerType: result.answerType || 'multiple_choice'
             }));

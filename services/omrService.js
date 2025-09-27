@@ -120,6 +120,7 @@ class OMRService {
             const results = [];
             let totalScore = 0;
             let totalQuestions = questions.length;
+            let maxPossibleScore = 0;
             let answeredQuestions = 0;
             let correctAnswers = 0;
 
@@ -127,6 +128,9 @@ class OMRService {
             const questionMap = {};
             questions.forEach(q => {
                 questionMap[q.question_number] = q;
+                // Calculate max possible score
+                const maxPoints = q.points_per_blank || q.max_points || 1;
+                maxPossibleScore += maxPoints;
             });
 
             // Evaluate each detected answer
@@ -141,31 +145,107 @@ class OMRService {
 
                 // Get correct answers (support both single and multiple correct answers)
                 let correctOptions = [];
+                let weightages = {};
+                let maxPoints = 1;
+                
                 if (question.correct_option) {
-                    // Single correct answer
-                    correctOptions = [question.correct_option.toUpperCase()];
+                    // Single correct answer - check if it's a label or content
+                    if (question.options && question.options[question.correct_option]) {
+                        // It's a label, convert to content
+                        correctOptions = [question.options[question.correct_option].trim()];
+                    } else {
+                        // It's already content or no options mapping available
+                        correctOptions = [question.correct_option.trim()];
+                    }
                 } else if (question.correct_options && Array.isArray(question.correct_options)) {
-                    // Multiple correct answers
-                    correctOptions = question.correct_options.map(opt => opt.toUpperCase());
-                } else {
+                    // Multiple correct answers - check if they're labels or content
+                    correctOptions = question.correct_options.map(opt => {
+                        if (question.options && question.options[opt]) {
+                            // It's a label, convert to content
+                            return question.options[opt].trim();
+                        } else {
+                            // It's already content or no options mapping available
+                            return opt.trim();
+                        }
+                    });
+                }
+                
+                // Extract weightages and maxPoints if available
+                if (question.weightages && typeof question.weightages === 'object') {
+                    // Convert weightages to use content as keys if needed
+                    if (question.options) {
+                        Object.keys(question.weightages).forEach(key => {
+                            if (question.options[key]) {
+                                // Convert label-based weightage to content-based
+                                weightages[question.options[key].trim()] = question.weightages[key];
+                            } else {
+                                // Already content-based or direct mapping
+                                weightages[key] = question.weightages[key];
+                            }
+                        });
+                    } else {
+                        weightages = question.weightages;
+                    }
+                }
+                if (question.points_per_blank && question.points_per_blank > 0) {
+                    maxPoints = question.points_per_blank;
+                } else if (question.max_points && question.max_points > 0) {
+                    maxPoints = question.max_points;
+                }
+                
+                if (correctOptions.length === 0) {
                     console.warn(`⚠️ No correct answer defined for question ${detected.question}`);
                     return;
                 }
 
-                // Get student answers (handle both old and new format)
+                // Get student answers and convert labels to content
                 let studentOptions = [];
                 if (detected.selected_options && Array.isArray(detected.selected_options)) {
-                    // New format with multiple options
-                    studentOptions = detected.selected_options.map(opt => opt.toUpperCase());
+                    // New format with multiple options - convert labels to content
+                    studentOptions = detected.selected_options.map(opt => {
+                        // Try case-insensitive match for option labels
+                        const upperOpt = opt.toString().toUpperCase();
+                        if (question.options && question.options[upperOpt]) {
+                            // It's a label, convert to content
+                            return question.options[upperOpt].trim();
+                        } else {
+                            // Check case-insensitive match
+                            const matchedKey = Object.keys(question.options || {}).find(key => 
+                                key.toUpperCase() === upperOpt
+                            );
+                            if (matchedKey && question.options[matchedKey]) {
+                                return question.options[matchedKey].trim();
+                            }
+                            // It's already content or no options mapping available
+                            return opt.toString().trim();
+                        }
+                    });
                 } else if (detected.selected_option) {
-                    // Old format with single option
-                    studentOptions = [detected.selected_option.toUpperCase()];
+                    // Old format with single option - convert label to content
+                    const upperOpt = detected.selected_option.toString().toUpperCase();
+                    if (question.options && question.options[upperOpt]) {
+                        // It's a label, convert to content
+                        studentOptions = [question.options[upperOpt].trim()];
+                    } else {
+                        // Check case-insensitive match
+                        const matchedKey = Object.keys(question.options || {}).find(key => 
+                            key.toUpperCase() === upperOpt
+                        );
+                        if (matchedKey && question.options[matchedKey]) {
+                            studentOptions = [question.options[matchedKey].trim()];
+                        } else {
+                            // It's already content or no options mapping available
+                            studentOptions = [detected.selected_option.toString().trim()];
+                        }
+                    }
                 }
 
-                // Calculate score based on matching
-                const { score, isCorrect, details } = this.calculateMultipleChoiceScore(
+                // Calculate score based on matching with weightages support
+                const { score, isCorrect, details, weightageBreakdown } = this.calculateMultipleChoiceScore(
                     studentOptions, 
-                    correctOptions
+                    correctOptions,
+                    weightages,
+                    maxPoints
                 );
 
                 if (isCorrect || score > 0) {
@@ -179,10 +259,11 @@ class OMRService {
                     correct_answers: correctOptions,
                     is_correct: isCorrect,
                     partial_score: score,
-                    max_points: 1,
+                    max_points: maxPoints,
                     confidence: detected.confidence,
                     marking_type: detected.marking_type || 'unknown',
-                    evaluation_details: details
+                    evaluation_details: details,
+                    weightage_breakdown: weightageBreakdown || []
                 });
             });
 
@@ -196,6 +277,8 @@ class OMRService {
                     } else if (q.correct_options && Array.isArray(q.correct_options)) {
                         correctOptions = q.correct_options.map(opt => opt.toUpperCase());
                     }
+                    
+                    const maxPoints = q.points_per_blank || q.max_points || 1;
 
                     results.push({
                         question_number: q.question_number,
@@ -203,7 +286,7 @@ class OMRService {
                         correct_answers: correctOptions,
                         is_correct: false,
                         partial_score: 0,
-                        max_points: 1,
+                        max_points: maxPoints,
                         confidence: null,
                         marking_type: 'none',
                         evaluation_details: 'No answer detected'
@@ -211,7 +294,7 @@ class OMRService {
                 }
             });
 
-            const percentage = totalQuestions > 0 ? (totalScore / totalQuestions) * 100 : 0;
+            const percentage = maxPossibleScore > 0 ? (totalScore / maxPossibleScore) * 100 : 0;
 
             return {
                 results,
@@ -220,7 +303,7 @@ class OMRService {
                     answered_questions: answeredQuestions,
                     correct_answers: correctAnswers,
                     total_score: totalScore,
-                    max_score: totalQuestions,
+                    max_score: maxPossibleScore,
                     percentage: Math.round(percentage * 100) / 100,
                     grade: this.calculateGrade(percentage)
                 }
@@ -234,11 +317,14 @@ class OMRService {
 
     /**
      * Calculate score for multiple choice questions with multiple correct answers
+     * NEW: Supports weightage-based scoring where wrong options result in zero marks
      * @param {Array} studentAnswers - Array of student selected options
      * @param {Array} correctAnswers - Array of correct options
+     * @param {Object} weightages - Weightage mapping for correct options (optional)
+     * @param {number} maxPoints - Maximum points for this question (default: 1)
      * @returns {Object} Score calculation result
      */
-    calculateMultipleChoiceScore(studentAnswers, correctAnswers) {
+    calculateMultipleChoiceScore(studentAnswers, correctAnswers, weightages = {}, maxPoints = 1) {
         // Handle empty arrays
         if (studentAnswers.length === 0) {
             return {
@@ -256,52 +342,112 @@ class OMRService {
             };
         }
 
+        // 🔄 CASE-INSENSITIVE COMPARISON: Normalize all options
+        const normalizeOption = (opt) => opt.toString().trim().toLowerCase();
+        
+        const normalizedStudentAnswers = studentAnswers.map(normalizeOption);
+        const normalizedCorrectAnswers = correctAnswers.map(normalizeOption);
+        
         // Convert to sets for easier comparison
-        const studentSet = new Set(studentAnswers);
-        const correctSet = new Set(correctAnswers);
+        const studentSet = new Set(normalizedStudentAnswers);
+        const correctSet = new Set(normalizedCorrectAnswers);
 
-        // Calculate matches
+        // Calculate matches using normalized versions
         const correctSelections = [...studentSet].filter(ans => correctSet.has(ans));
         const incorrectSelections = [...studentSet].filter(ans => !correctSet.has(ans));
-        const missedSelections = [...correctSet].filter(ans => !studentSet.has(ans));
 
-        // Scoring logic for multiple correct answers
-        if (correctAnswers.length === 1) {
-            // Single correct answer
-            const isExactMatch = correctSelections.length === 1 && incorrectSelections.length === 0;
+        // NEW LOGIC: If any wrong option is selected, score is 0
+        if (incorrectSelections.length > 0) {
             return {
-                score: isExactMatch ? 1 : 0,
-                isCorrect: isExactMatch,
-                details: isExactMatch ? 'Correct' : 
-                        incorrectSelections.length > 0 ? 'Incorrect answer selected' : 'Wrong answer'
+                score: 0,
+                isCorrect: false,
+                details: `Wrong option(s) selected: ${incorrectSelections.join(', ')}. No partial marking.`,
+                weightageBreakdown: []
+            };
+        }
+
+        // Only correct options selected - calculate score using original options for weightage lookup
+        let questionScore = 0;
+        const breakdown = [];
+
+        // Check if we have weightages defined
+        const hasWeightages = Object.keys(weightages).length > 0;
+
+        if (hasWeightages) {
+            // Use weightage-based scoring - map back to original options for weightage lookup
+            questionScore = studentAnswers.reduce((sum, originalOption) => {
+                const normalizedOption = normalizeOption(originalOption);
+                if (correctSet.has(normalizedOption)) {
+                    // Find case-insensitive match in weightages
+                    let weight = 0;
+                    if (weightages[originalOption]) {
+                        weight = weightages[originalOption];
+                    } else {
+                        // Try case-insensitive match
+                        const matchedKey = Object.keys(weightages).find(key => 
+                            normalizeOption(key) === normalizedOption
+                        );
+                        if (matchedKey) {
+                            weight = weightages[matchedKey];
+                        }
+                    }
+                    breakdown.push({ option: originalOption, weight });
+                    return sum + weight;
+                } else {
+                    return sum;
+                }
+            }, 0);
+            
+            // Round to 2 decimal places
+            questionScore = Math.round(questionScore * 100) / 100;
+            
+            const isCorrect = (correctSelections.length === correctAnswers.length) && (questionScore === maxPoints);
+            
+            return {
+                score: questionScore,
+                isCorrect: isCorrect,
+                details: correctSelections.length === correctAnswers.length ? 
+                    `All correct options selected. Score: ${questionScore}/${maxPoints}` :
+                    `Partial correct options: ${correctSelections.join(', ')}. Score: ${questionScore}/${maxPoints}`,
+                weightageBreakdown: breakdown
             };
         } else {
-            // Multiple correct answers - use proportional scoring
-            const totalCorrect = correctAnswers.length;
-            const correctlySelected = correctSelections.length;
-            const incorrectlySelected = incorrectSelections.length;
-
-            // Perfect match gets full score
-            if (correctlySelected === totalCorrect && incorrectlySelected === 0) {
+            // Traditional scoring logic (backward compatibility)
+            if (correctAnswers.length === 1) {
+                // Single correct answer
+                const isExactMatch = correctSelections.length === 1 && incorrectSelections.length === 0;
                 return {
-                    score: 1,
-                    isCorrect: true,
-                    details: 'All correct answers selected'
+                    score: isExactMatch ? maxPoints : 0,
+                    isCorrect: isExactMatch,
+                    details: isExactMatch ? 'Correct' : 'Wrong answer'
+                };
+            } else {
+                // Multiple correct answers - proportional scoring
+                const totalCorrect = correctAnswers.length;
+                const correctlySelected = correctSelections.length;
+
+                // Perfect match gets full score
+                if (correctlySelected === totalCorrect) {
+                    return {
+                        score: maxPoints,
+                        isCorrect: true,
+                        details: 'All correct answers selected'
+                    };
+                }
+
+                // Partial credit based on correct selections
+                let partialScore = 0;
+                if (correctlySelected > 0) {
+                    partialScore = (correctlySelected / totalCorrect) * maxPoints;
+                    partialScore = Math.round(partialScore * 100) / 100;
+                }
+
+                return {
+                    score: partialScore,
+                    isCorrect: partialScore >= (0.8 * maxPoints), // Consider 80%+ as "correct"
+                    details: `Partial credit: ${correctlySelected}/${totalCorrect} correct`
                 };
             }
-
-            // Partial credit based on correct selections minus penalties for wrong selections
-            let partialScore = 0;
-            if (correctlySelected > 0) {
-                partialScore = Math.max(0, (correctlySelected - incorrectlySelected * 0.5) / totalCorrect);
-                partialScore = Math.round(partialScore * 100) / 100; // Round to 2 decimal places
-            }
-
-            return {
-                score: partialScore,
-                isCorrect: partialScore >= 0.8, // Consider 80%+ as "correct"
-                details: `Partial credit: ${correctlySelected}/${totalCorrect} correct, ${incorrectlySelected} wrong`
-            };
         }
     }
 

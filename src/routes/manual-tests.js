@@ -35,16 +35,18 @@ router.post('/create-manual', async (req, res) => {
             if (opt && opt.id && opt.text !== undefined) {
               options[opt.id] = opt.text;
               if (opt.isCorrect) {
-                correctOptions.push(opt.id);
-                // Handle weightage - allow 0 and decimal values
+                // 🔄 FIXED: Store actual answer text content instead of option labels
+                correctOptions.push(opt.text.trim()); // ✅ Store "C", "E" instead of "A", "B"
+                
+                // Handle weightage - store by actual text content, not option ID
                 const weight = parseFloat(opt.weight);
                 if (!isNaN(weight) && weight >= 0) {
-                  weightages[opt.id] = weight;
+                  weightages[opt.text.trim()] = weight; // ✅ Key by actual content
                 } else {
                   // Default to 1 if invalid weight
-                  weightages[opt.id] = 1;
+                  weightages[opt.text.trim()] = 1;
                 }
-                console.log(`  Option ${opt.id}: weight = ${opt.weight} → parsed as ${weightages[opt.id]}`);
+                console.log(`  Option ${opt.id} (${opt.text}): weight = ${opt.weight} → stored as weightages["${opt.text.trim()}"] = ${weightages[opt.text.trim()]}`);
               }
             }
           });
