@@ -7,15 +7,23 @@ const router = express.Router();
 // Create manual test
 router.post('/create-manual', async (req, res) => {
   try {
-    const { testName, questions } = req.body;
+    const { testName, totalMarks, questions } = req.body;
     
     if (!testName || !questions || !Array.isArray(questions) || questions.length === 0) {
       return res.status(400).json({ error: 'Test name and questions are required' });
     }
+    
+    // Fix: Use parseFloat instead of parseInt to handle decimal marks
+    const testTotalMarks = parseFloat(totalMarks) || 0;
+    
+    if (testTotalMarks <= 0) {
+      return res.status(400).json({ error: 'Total marks must be greater than 0' });
+    }
 
-    console.log(`🚀 Creating manual test: "${testName}" with ${questions.length} questions`);
-
-    // Prepare all question data first to minimize transaction time
+    console.log(`🚀 Creating manual test: "${testName}" with ${questions.length} questions, total marks: ${testTotalMarks}`);
+    
+    // Calculate sum of individual question marks for validation
+    let calculatedTotalMarks = 0;
     const questionData = [];
     
     for (let i = 0; i < questions.length; i++) {
@@ -69,6 +77,9 @@ router.post('/create-manual', async (req, res) => {
       const totalMarks = parseFloat(question.totalMarks);
       const pointsPerBlank = !isNaN(totalMarks) && totalMarks >= 0 ? totalMarks : 1;
       
+      // Add to running total for validation
+      calculatedTotalMarks += pointsPerBlank;
+      
       console.log(`  Total marks: ${question.totalMarks} → parsed as ${pointsPerBlank}`);
       console.log(`  Weightages: ${JSON.stringify(weightages)}`);
 
@@ -83,6 +94,15 @@ router.post('/create-manual', async (req, res) => {
         weightages: weightages
       });
     }
+    
+    // Validate that total marks equals sum of individual question marks
+    if (Math.abs(calculatedTotalMarks - testTotalMarks) > 0.01) { // Allow small floating point differences
+      return res.status(400).json({ 
+        error: `Total marks validation failed. Expected: ${testTotalMarks}, Sum of questions: ${calculatedTotalMarks}. Please ensure the total marks equals the sum of all individual question marks.`
+      });
+    }
+    
+    console.log(`✅ Marks validation passed: Total=${testTotalMarks}, Sum=${calculatedTotalMarks}`);
 
     // Use optimized Prisma transaction with timeout
     const result = await prisma.$transaction(async (tx) => {
@@ -92,6 +112,7 @@ router.post('/create-manual', async (req, res) => {
       const paper = await tx.paper.create({
         data: {
           name: testName,
+          totalMarks: testTotalMarks,
           uploadedAt: new Date(),
           totalPages: 1,
           questionType: 'traditional',

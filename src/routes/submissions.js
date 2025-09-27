@@ -779,13 +779,15 @@ router.post('/evaluate/:submissionId', async (req, res) => {
           selectedOptions: result.selectedOptions || (result.studentOption ? result.studentOption.split(',') : []),
           isCorrect: result.isCorrect,
           textAnswer: result.textAnswer,
-          answerType: result.answerType || 'mcq'
+          answerType: result.answerType || 'mcq',
+          // NEW: Store weightage-based scoring details
+          partialScore: result.partialScore || (result.isCorrect ? 1 : 0),
+          maxPoints: result.maxPoints || 1,
+          details: result.details,
+          weightageBreakdown: result.weightageBreakdown || []
         };
         
-        // Add weightage breakdown details if available
-        if (result.details) {
-          answerData.textAnswer = result.details;
-        }
+        console.log(`💾 Storing answer for Q${result.questionNumber}: score=${answerData.partialScore}/${answerData.maxPoints}`);
         
         await tx.studentAnswer.create({
           data: answerData
@@ -935,9 +937,21 @@ router.get('/:id', async (req, res) => {
       };
     });
 
+    // Parse evaluation details to get maxPossibleScore if available
+    let maxPossibleScore = null;
+    if (submission.evaluationDetails) {
+      try {
+        const details = JSON.parse(submission.evaluationDetails);
+        maxPossibleScore = details.maxPossibleScore || details.maxScore;
+      } catch (e) {
+        console.log('Could not parse evaluation details for maxPossibleScore');
+      }
+    }
+
     res.json({
       ...submission,
       paper_name: submission.paper.name,
+      maxPossibleScore: maxPossibleScore,
       answers: answersWithQuestions
     });
   } catch (error) {
@@ -1197,6 +1211,19 @@ router.post('/evaluate-pending', async (req, res) => {
     
     const evaluationResult = evaluateAnswers(questions, allStudentAnswers, 'multiple_choice', evaluationMethod);
     console.log('🔍 Debug - Evaluation result:', evaluationResult);
+    console.log('📊 Score breakdown:', {
+      totalScore: evaluationResult.score || evaluationResult.totalScore,
+      maxScore: evaluationResult.maxPossibleScore || evaluationResult.totalQuestions,
+      resultsCount: evaluationResult.results?.length || 0
+    });
+    
+    // Debug: Log first few results to understand scoring structure
+    if (evaluationResult.results && evaluationResult.results.length > 0) {
+      console.log('🔍 Sample question results:');
+      evaluationResult.results.slice(0, 3).forEach((result, i) => {
+        console.log(`  Q${result.questionNumber}: score=${result.partialScore || (result.isCorrect ? 1 : 0)}, max=${result.maxPoints || 1}, correct=${result.isCorrect}`);
+      });
+    }
     
     // Create or update submission in database
     const maxScore = evaluationResult.maxPossibleScore || evaluationResult.totalQuestions;
@@ -1251,8 +1278,18 @@ router.post('/evaluate-pending', async (req, res) => {
               isCorrect: result.isCorrect || false,
               textAnswer: result.details || result.textAnswer || null,
               blankAnswers: result.blankAnswers || {},
-              answerType: result.answerType || 'multiple_choice'
+              answerType: result.answerType || 'multiple_choice',
+              // NEW: Store detailed scoring information
+              partialScore: result.partialScore ?? (result.isCorrect ? 1 : 0),
+              maxPoints: result.maxPoints ?? 1,
+              details: result.details || null,
+              weightageBreakdown: result.weightageBreakdown || []
             }));
+            
+            console.log(`📊 Storing ${answerData.length} answers with scoring details`);
+            answerData.forEach((answer, i) => {
+              console.log(`  Q${answer.questionNumber}: ${answer.partialScore}/${answer.maxPoints} points (${answer.isCorrect ? '✓' : '✗'})`);
+            });
             
             // Use createMany for better performance
             await tx.studentAnswer.createMany({
