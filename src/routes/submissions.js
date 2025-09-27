@@ -185,14 +185,23 @@ const evaluateAnswersWithWeightages = (correctAnswers, studentAnswers) => {
 
   // Create a map of student answers for quick lookup
   const studentAnswerMap = {};
+  console.log('🔍 Debug - Processing student answers for weightage mapping:', studentAnswers);
+  
   studentAnswers.forEach(a => {
-    const questionNum = a.question || a.questionNumber;
+    // Handle all possible field name formats
+    const questionNum = a.question_number || a.question || a.questionNumber;
+    console.log(`🔍 Mapping weightage answer for Q${questionNum}:`, a);
     
-    if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
-      studentAnswerMap[questionNum] = a.selectedOptions; // 🔄 REMOVED: Don't force uppercase - preserve for conversion
+    if (a.selected_options && Array.isArray(a.selected_options)) {
+      studentAnswerMap[questionNum] = a.selected_options; // Preserve case for weightage conversion
+    } else if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
+      studentAnswerMap[questionNum] = a.selectedOptions;
+    } else if (a.selected_option) {
+      studentAnswerMap[questionNum] = [a.selected_option];
     } else if (a.selectedOption) {
-      studentAnswerMap[questionNum] = [a.selectedOption]; // 🔄 REMOVED: Don't force uppercase - preserve for conversion
+      studentAnswerMap[questionNum] = [a.selectedOption];
     } else {
+      console.log(`⚠️ No valid answer found for Q${questionNum} in weightage evaluation`);
       studentAnswerMap[questionNum] = [];
     }
   });
@@ -313,6 +322,7 @@ const evaluateAnswersWithWeightages = (correctAnswers, studentAnswers) => {
       questionNumber,
       correctOption: correctOptions.join(','),
       studentOption: studentOptions.join(','),
+      selectedOptions: studentOptions, // Add the array for proper storage
       isCorrect,
       partialScore: questionScore,
       maxPoints: maxPoints,
@@ -367,15 +377,23 @@ const evaluateAnswersTraditional = (correctAnswers, studentAnswers) => {
 
   // Create a map of student answers for quick lookup
   const studentAnswerMap = {};
+  console.log('🔍 Debug - Processing student answers for mapping:', studentAnswers);
+  
   studentAnswers.forEach(a => {
-    // Handle both field name formats
-    const questionNum = a.question || a.questionNumber;
+    // Handle all possible field name formats
+    const questionNum = a.question_number || a.question || a.questionNumber;
+    console.log(`🔍 Mapping answer for Q${questionNum}:`, a);
     
-    if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
+    if (a.selected_options && Array.isArray(a.selected_options)) {
+      studentAnswerMap[questionNum] = a.selected_options.map(opt => opt.toUpperCase());
+    } else if (a.selectedOptions && Array.isArray(a.selectedOptions)) {
       studentAnswerMap[questionNum] = a.selectedOptions.map(opt => opt.toUpperCase());
+    } else if (a.selected_option) {
+      studentAnswerMap[questionNum] = [a.selected_option.toUpperCase()];
     } else if (a.selectedOption) {
       studentAnswerMap[questionNum] = [a.selectedOption.toUpperCase()];
     } else {
+      console.log(`⚠️ No valid answer found for Q${questionNum}`);
       studentAnswerMap[questionNum] = [];
     }
   });
@@ -394,28 +412,45 @@ const evaluateAnswersTraditional = (correctAnswers, studentAnswers) => {
     let isCorrect = false;
     let partialScore = 0;
 
-    if (correctOptions.length === 1) {
-      // Single correct answer
-      isCorrect = studentOptions.length === 1 && studentOptions[0] === correctOptions[0];
-      partialScore = isCorrect ? 1 : 0;
-      console.log(`🔍 Debug - Q${questionNumber}: Single answer - isCorrect=${isCorrect}, score=${partialScore}`);
+    // NEW STRICT EVALUATION LOGIC: If any wrong option is selected, score is 0
+    const correctSet = new Set(correctOptions);
+    const studentSet = new Set(studentOptions);
+    
+    // Check if any wrong option is selected
+    const wrongOptions = [...studentSet].filter(ans => !correctSet.has(ans));
+    
+    if (wrongOptions.length > 0) {
+      // Case: Any wrong option selected = 0 marks (STRICT RULE)
+      isCorrect = false;
+      partialScore = 0;
+      console.log(`🔍 Debug - Q${questionNumber}: Wrong option(s) [${wrongOptions.join(',')}] selected - score=0`);
+    } else if (studentOptions.length === 0) {
+      // Case: No options selected
+      isCorrect = false;
+      partialScore = 0;
+      console.log(`🔍 Debug - Q${questionNumber}: No options selected - score=0`);
     } else {
-      // Multiple correct answers - use proportional scoring
-      const correctSet = new Set(correctOptions);
-      const studentSet = new Set(studentOptions);
-      
-      const correctSelections = [...studentSet].filter(ans => correctSet.has(ans)).length;
-      const incorrectSelections = [...studentSet].filter(ans => !correctSet.has(ans)).length;
-      
-      if (correctSelections === correctOptions.length && incorrectSelections === 0) {
-        isCorrect = true;
-        partialScore = 1;
-      } else if (correctSelections > 0) {
-        partialScore = Math.max(0, (correctSelections - incorrectSelections * 0.5) / correctOptions.length);
-        partialScore = Math.round(partialScore * 100) / 100;
-        isCorrect = partialScore >= 0.8; // Consider 80%+ as correct
+      // Case: Only correct options selected - calculate score
+      if (correctOptions.length === 1) {
+        // Single correct answer - exact match required
+        isCorrect = studentOptions.length === 1 && studentOptions[0] === correctOptions[0];
+        partialScore = isCorrect ? 1 : (studentOptions.includes(correctOptions[0]) ? 1 : 0);
+      } else {
+        // Multiple correct answers - proportional scoring for correct selections only
+        const correctSelections = [...studentSet].filter(ans => correctSet.has(ans)).length;
+        
+        if (correctSelections === correctOptions.length) {
+          // All correct options selected
+          isCorrect = true;
+          partialScore = 1;
+        } else if (correctSelections > 0) {
+          // Partial correct options selected (but no wrong options)
+          partialScore = correctSelections / correctOptions.length;
+          partialScore = Math.round(partialScore * 100) / 100;
+          isCorrect = partialScore >= 0.8; // Consider 80%+ as correct
+        }
       }
-      console.log(`🔍 Debug - Q${questionNumber}: Multiple answers - isCorrect=${isCorrect}, score=${partialScore}`);
+      console.log(`🔍 Debug - Q${questionNumber}: Only correct options - score=${partialScore}`);
     }
 
     if (isCorrect || partialScore > 0) score += partialScore;
@@ -424,18 +459,27 @@ const evaluateAnswersTraditional = (correctAnswers, studentAnswers) => {
       questionNumber,
       correctOption: correctOptions.join(','),
       studentOption: studentOptions.join(','),
+      selectedOptions: studentOptions, // Add the array for proper storage
       isCorrect,
       partialScore
     });
   }
 
-  const percentage = (score / totalQuestions) * 100;
+  // Calculate maximum possible score from questions
+  let maxPossibleScore = 0;
+  correctAnswers.forEach(q => {
+    const maxPoints = q.pointsPerBlank || q.points_per_blank || 1;
+    maxPossibleScore += maxPoints;
+  });
 
-  console.log(`🔍 Debug - Final evaluation: score=${score}, total=${totalQuestions}, percentage=${percentage}`);
+  const percentage = maxPossibleScore > 0 ? (score / maxPossibleScore) * 100 : 0;
+
+  console.log(`🔍 Debug - Final evaluation: score=${score}, maxPossible=${maxPossibleScore}, percentage=${percentage}`);
 
   return {
     score,
     totalQuestions,
+    maxPossibleScore,
     percentage,
     results: answerResults,
     answerResults
@@ -796,7 +840,7 @@ router.post('/evaluate/:submissionId', async (req, res) => {
     });
 
     console.log(`✅ Evaluation completed for ${submission.studentName} (Roll: ${submission.rollNo})`);
-    console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
+    console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.maxPossibleScore || evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
 
     res.json({
       success: true,
@@ -805,6 +849,7 @@ router.post('/evaluate/:submissionId', async (req, res) => {
       rollNo: submission.rollNo,
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
+      maxPossibleScore: evaluationResult.maxPossibleScore || evaluationResult.totalQuestions,
       percentage: evaluationResult.percentage,
       evaluationStatus: 'evaluated'
     });
@@ -979,14 +1024,26 @@ router.get('/pending-files/:paperId', async (req, res) => {
     try {
       // Get all PENDING_ files from Google Drive
       const pendingFiles = await googleDriveService.listPendingFiles();
+      console.log(`📋 Found ${pendingFiles.length} total pending files in Google Drive`);
+      console.log(`🔍 Filtering for paper: "${paper.name}" (cleaned: "${paper.name.replace(/[^a-zA-Z0-9]/g, '_')}")`);
       
-      // Parse file names to extract student info
+      // Parse file names to extract student info and filter by current paper
       const pendingFromDrive = pendingFiles
         .map(file => {
           // Extract info from pending_{name}_{rollno}_{testname}_{pageno}.png format
           const match = file.name.match(/^pending_(.+?)_(.+?)_(.+?)_(\d+)\.png$/i);
           if (match) {
             const [, name, rollNo, testName, pageNo] = match;
+            
+            // Clean the current paper name the same way it's cleaned during upload
+            const cleanCurrentPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+            
+            // Compare the cleaned test names
+            if (testName.toLowerCase() !== cleanCurrentPaperName.toLowerCase()) {
+              console.log(`📋 Filtering out ${file.name} - test name '${testName}' doesn't match current paper cleaned name '${cleanCurrentPaperName}'`);
+              return null;
+            }
+            
             return {
               fileId: file.id,
               fileName: file.name,
@@ -1003,13 +1060,15 @@ router.get('/pending-files/:paperId', async (req, res) => {
         })
         .filter(Boolean);
       
+      console.log(`📊 After filtering: ${pendingFromDrive.length} files match paper "${paper.name}"`);
       pendingSubmissions = pendingFromDrive;
     } catch (driveError) {
       console.error('⚠️ Google Drive error (continuing with database only):', driveError.message);
     }
     
-    // Also get pending submissions from database
+    // Also get pending submissions from database for this specific paper
     try {
+      console.log(`🗄️  Checking database for pending submissions for paper ID: ${paperId}`);
       const pendingFromDB = await prisma.studentSubmission.findMany({
         where: {
           paperId: paperId,
@@ -1017,6 +1076,8 @@ router.get('/pending-files/:paperId', async (req, res) => {
         },
         orderBy: { submittedAt: 'desc' }
       });
+      
+      console.log(`📊 Found ${pendingFromDB.length} pending database submissions for this paper`);
       
       // Convert database submissions to the same format, but filter out duplicates
       const pendingFromDatabase = pendingFromDB
@@ -1045,14 +1106,92 @@ router.get('/pending-files/:paperId', async (req, res) => {
       console.error('⚠️ Database error:', dbError.message);
     }
     
+    // Group multi-page submissions by student (rollNo + studentName)
+    const groupedSubmissions = new Map();
+    
+    pendingSubmissions.forEach(submission => {
+      const studentKey = `${submission.rollNo}_${submission.studentName}`;
+      
+      if (!groupedSubmissions.has(studentKey)) {
+        groupedSubmissions.set(studentKey, {
+          studentName: submission.studentName,
+          rollNo: submission.rollNo,
+          paperName: submission.paperName,
+          source: submission.source,
+          pages: [],
+          totalPages: 0,
+          uploadedAt: submission.uploadedAt, // Will be updated to latest
+          // For single page or database submissions
+          fileName: submission.fileName,
+          fileId: submission.fileId,
+          submissionId: submission.submissionId,
+          imageUrl: submission.imageUrl
+        });
+      }
+      
+      const group = groupedSubmissions.get(studentKey);
+      
+      // Add page information
+      if (submission.pageNumber) {
+        group.pages.push({
+          pageNumber: submission.pageNumber,
+          fileId: submission.fileId,
+          fileName: submission.fileName,
+          uploadedAt: submission.uploadedAt
+        });
+        group.totalPages = Math.max(group.totalPages, submission.pageNumber);
+        // Update uploadedAt to most recent page
+        if (new Date(submission.uploadedAt) > new Date(group.uploadedAt)) {
+          group.uploadedAt = submission.uploadedAt;
+        }
+      } else {
+        // Single page submission or database submission
+        group.totalPages = 1;
+        group.pages.push({
+          pageNumber: 1,
+          fileId: submission.fileId,
+          fileName: submission.fileName,
+          submissionId: submission.submissionId,
+          imageUrl: submission.imageUrl,
+          uploadedAt: submission.uploadedAt
+        });
+      }
+    });
+    
+    // Convert back to array and sort pages within each group
+    const consolidatedSubmissions = Array.from(groupedSubmissions.values()).map(group => {
+      // Sort pages by page number
+      group.pages.sort((a, b) => (a.pageNumber || 1) - (b.pageNumber || 1));
+      
+      return {
+        studentName: group.studentName,
+        rollNo: group.rollNo,
+        paperName: group.paperName,
+        uploadedAt: group.uploadedAt,
+        source: group.source,
+        totalPages: group.totalPages,
+        pages: group.pages,
+        // For backward compatibility with single page
+        fileName: group.totalPages === 1 ? group.fileName : `${group.studentName}_${group.totalPages}_pages`,
+        fileId: group.totalPages === 1 ? group.fileId : null,
+        submissionId: group.totalPages === 1 ? group.submissionId : null,
+        imageUrl: group.totalPages === 1 ? group.imageUrl : null
+      };
+    });
+    
     // Sort by uploaded date
-    pendingSubmissions.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+    consolidatedSubmissions.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+    
+    console.log(`✅ Final result: ${consolidatedSubmissions.length} unique students with pending submissions for paper "${paper.name}"`);
+    if (consolidatedSubmissions.length > 0) {
+      console.log('📋 Students:', consolidatedSubmissions.map(s => `${s.studentName} (${s.rollNo})`).join(', '));
+    }
     
     res.json({
       paperId: paperId,
       paperName: paper.name,
-      count: pendingSubmissions.length,
-      pendingSubmissions: pendingSubmissions
+      count: consolidatedSubmissions.length,
+      pendingSubmissions: consolidatedSubmissions
     });
     
   } catch (error) {
@@ -1079,16 +1218,17 @@ const retryDatabaseOperation = async (operation, maxRetries = 3, delay = 1000) =
   }
 };
 
-// Evaluate a PENDING_ file (new workflow)
+// Evaluate a PENDING_ file (new workflow) - now supports multi-page submissions
 router.post('/evaluate-pending', async (req, res) => {
   try {
-    const { fileId, fileName, studentName, rollNo, paperId, submissionId, source } = req.body;
+    const { fileId, fileName, studentName, rollNo, paperId, submissionId, source, pages } = req.body;
     
     if (!studentName || !rollNo || !paperId) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    console.log(`🎓 Starting evaluation for ${source || 'PENDING'} file: ${fileName || submissionId}`);
+    console.log(`🎓 Starting evaluation for ${source || 'PENDING'} submission: ${studentName} (${rollNo})`);
+    console.log(`📄 Processing ${pages ? pages.length : 1} page(s)`);
     
     // Get paper and questions
     const paper = await prisma.paper.findUnique({
@@ -1117,82 +1257,160 @@ router.post('/evaluate-pending', async (req, res) => {
       return res.status(400).json({ error: 'Student already has an evaluated submission for this paper' });
     }
     
-    let imageBuffer;
+    // Handle multi-page or single page submission
+    const pagesToProcess = pages || [{
+      pageNumber: 1,
+      fileId: fileId,
+      fileName: fileName,
+      submissionId: submissionId,
+      imageUrl: source === 'database' ? req.body.imageUrl : null
+    }];
     
-    // Handle different sources
-    if (source === 'database' && submissionId) {
-      // Get submission from database
-      const dbSubmission = await prisma.studentSubmission.findUnique({
-        where: { id: parseInt(submissionId) }
-      });
-      
-      if (!dbSubmission) {
-        return res.status(404).json({ error: 'Database submission not found' });
-      }
-      
-      // Download image from Google Drive using the stored URL
-      console.log(`📄 Downloading file from database submission: ${dbSubmission.imageUrl}`);
-      imageBuffer = await googleDriveService.downloadImage(dbSubmission.imageUrl);
-      existingSubmission = dbSubmission;
-    } else {
-      // Handle Google Drive PENDING_ file
-      if (!fileId) {
-        return res.status(400).json({ error: 'Missing fileId for Google Drive file' });
-      }
-      
-      console.log(`📄 Downloading file from Google Drive: ${fileName}`);
-      imageBuffer = await googleDriveService.downloadImage(fileId);
-    }
-    
-    // Extract roll number from paper for validation
-    console.log('🔍 Extracting roll number from question paper...');
-    let rollNoFromPaper = null;
-    
-    try {
-      const rollNoResult = await geminiService.extractRollNumberFromImage(imageBuffer);
-      if (rollNoResult.success) {
-        rollNoFromPaper = rollNoResult.rollNumber;
-        console.log(`📋 Roll number from paper: ${rollNoFromPaper}`);
-      }
-    } catch (rollError) {
-      console.error('⚠️ Roll number extraction failed:', rollError.message);
-      // Continue without roll number validation
-    }
-    
-    // Validate roll number
-    if (rollNoFromPaper && rollNoFromPaper !== rollNo) {
-      console.log(`❌ Roll number mismatch: Paper shows ${rollNoFromPaper}, but file indicates ${rollNo}`);
-      
-      return res.status(400).json({ 
-        error: 'Roll number mismatch',
-        message: `The roll number in the question paper (${rollNoFromPaper}) does not match the roll number in the file name (${rollNo})`,
-        paperRollNo: rollNoFromPaper,
-        fileRollNo: rollNo
-      });
-    }
-    
-    // Extract answers using Gemini
-    console.log('🤖 Extracting answers using Gemini...');
     let allStudentAnswers = [];
+    let processedPages = 0;
     
-    // Process based on question type
-    const questionType = paper.questionType || 'traditional';
-    
-    if (questionType === 'omr' || questionType === 'mixed') {
-      // Use OMR detection
-      const omrResult = await omrService.detectOMRAnswers(imageBuffer, questions);
-      if (omrResult && omrResult.detected_answers) {
-        allStudentAnswers = omrResult.detected_answers;
+    // Process each page
+    for (const page of pagesToProcess) {
+      console.log(`📄 Processing page ${page.pageNumber}/${pagesToProcess.length}`);
+      
+      let imageBuffer;
+      
+      // Handle different sources for each page
+      if (source === 'database' && page.submissionId) {
+        // Get submission from database
+        const dbSubmission = await prisma.studentSubmission.findUnique({
+          where: { id: parseInt(page.submissionId) }
+        });
+        
+        if (!dbSubmission) {
+          console.error(`❌ Database submission not found for page ${page.pageNumber}`);
+          continue;
+        }
+        
+        // Download image from Google Drive using the stored URL
+        console.log(`📄 Downloading file from database submission: ${dbSubmission.imageUrl}`);
+        imageBuffer = await googleDriveService.downloadImage(dbSubmission.imageUrl);
+        if (page.pageNumber === 1) existingSubmission = dbSubmission;
+      } else {
+        // Handle Google Drive PENDING_ file
+        if (!page.fileId) {
+          console.error(`❌ Missing fileId for page ${page.pageNumber}`);
+          continue;
+        }
+        
+        console.log(`📄 Downloading file from Google Drive: ${page.fileName}`);
+        imageBuffer = await googleDriveService.downloadImage(page.fileId);
       }
+      
+      // Extract roll number from the first page only
+      if (page.pageNumber === 1) {
+        console.log('🔍 Extracting roll number from question paper...');
+        let rollNoFromPaper = null;
+        
+        try {
+          const rollNoResult = await geminiService.extractRollNumberFromImage(imageBuffer);
+          if (rollNoResult.success) {
+            rollNoFromPaper = rollNoResult.rollNumber;
+            console.log(`📋 Roll number from paper: ${rollNoFromPaper}`);
+          }
+        } catch (rollError) {
+          console.error('⚠️ Roll number extraction failed:', rollError.message);
+          // Continue without roll number validation
+        }
+        
+        // Validate roll number
+        if (rollNoFromPaper && rollNoFromPaper !== rollNo) {
+          console.log(`❌ Roll number mismatch: Paper shows ${rollNoFromPaper}, but file indicates ${rollNo}`);
+          
+          return res.status(400).json({ 
+            error: 'Roll number mismatch',
+            message: `The roll number in the question paper (${rollNoFromPaper}) does not match the roll number in the file name (${rollNo})`,
+            paperRollNo: rollNoFromPaper,
+            fileRollNo: rollNo
+          });
+        }
+      }
+      
+      // Get questions for this specific page
+      const pageQuestions = questions.filter(q => q.pageNumber === page.pageNumber);
+      console.log(`📊 Found ${pageQuestions.length} questions on page ${page.pageNumber}`);
+      
+      if (pageQuestions.length === 0) {
+        console.log(`⚠️ No questions found for page ${page.pageNumber}, skipping...`);
+        continue;
+      }
+      
+      // Extract answers for this page using Gemini
+      console.log(`🤖 Extracting answers from page ${page.pageNumber} using Gemini...`);
+      let pageAnswers = [];
+      
+      // Process based on question type
+      const questionType = paper.questionType || 'traditional';
+      console.log(`📋 Paper question type: ${questionType}`);
+      console.log(`📋 Page questions:`, pageQuestions.map(q => ({ 
+        questionNumber: q.questionNumber, 
+        pageNumber: q.pageNumber,
+        questionType: q.questionType 
+      })));
+      
+      if (questionType === 'omr' || questionType === 'mixed') {
+        // Use OMR detection
+        console.log(`🤖 Using OMR detection for page ${page.pageNumber}...`);
+        const omrResult = await omrService.detectOMRAnswers(imageBuffer, pageQuestions);
+        console.log(`📊 OMR result:`, omrResult);
+        
+        if (omrResult && omrResult.detected_answers) {
+          console.log(`✅ OMR detected ${omrResult.detected_answers.length} answers`);
+          pageAnswers = omrResult.detected_answers.map(answer => ({
+            question_number: answer.question,
+            selected_option: answer.selected_options && answer.selected_options.length > 0 
+              ? answer.selected_options[0].toUpperCase() : '',
+            selected_options: answer.selected_options ? answer.selected_options.map(opt => opt.toUpperCase()) : [],
+            confidence: answer.confidence || 'medium'
+          }));
+          console.log(`🔍 Converted OMR answers:`, pageAnswers);
+        } else {
+          console.log(`❌ OMR detection failed, falling back to Gemini`);
+        }
+      }
+      
+      if (pageAnswers.length === 0) {
+        // Fall back to traditional Gemini extraction
+        console.log(`🤖 Gemini extraction for page ${page.pageNumber}...`);
+        const geminiResult = await geminiService.extractStudentAnswersFromBuffer(imageBuffer);
+        if (geminiResult.success && geminiResult.answers) {
+          console.log(`📄 Gemini extracted ${geminiResult.answers.length} answers from page ${page.pageNumber}`);
+          console.log('🔍 Raw Gemini answers:', geminiResult.answers);
+          
+          // Convert Gemini format to expected format and filter by page questions
+          pageAnswers = geminiResult.answers
+            .filter(answer => pageQuestions.some(q => q.questionNumber === answer.question))
+            .map(answer => ({
+              question_number: answer.question,
+              selected_option: answer.selectedOption ? answer.selectedOption.toUpperCase() : '',
+              selected_options: answer.selectedOptions ? answer.selectedOptions.map(opt => opt.toUpperCase()) : [],
+              confidence: answer.confidence || 'medium'
+            }));
+          
+          console.log(`✅ Filtered and converted ${pageAnswers.length} answers for page ${page.pageNumber}`);
+          console.log('🔍 Converted answers:', pageAnswers);
+        } else {
+          console.error(`❌ Gemini extraction failed for page ${page.pageNumber}:`, geminiResult.error || 'Unknown error');
+        }
+      }
+      
+      // Add page-specific answers to the total
+      allStudentAnswers.push(...pageAnswers);
+      processedPages++;
+      
+      console.log(`✅ Page ${page.pageNumber} processed - found ${pageAnswers.length} answers`);
     }
     
-    if (allStudentAnswers.length === 0) {
-      // Fall back to traditional Gemini extraction
-      const geminiResult = await geminiService.extractStudentAnswersFromBuffer(imageBuffer);
-      if (geminiResult.success) {
-        allStudentAnswers = geminiResult.answers;
-      }
+    if (processedPages === 0) {
+      return res.status(400).json({ error: 'No pages could be processed successfully' });
     }
+    
+    console.log(`📊 Total answers extracted from ${processedPages} pages: ${allStudentAnswers.length}`);
     
     // Evaluate answers
     console.log('📊 Evaluating answers...');
@@ -1355,7 +1573,25 @@ router.post('/evaluate-pending', async (req, res) => {
     }
     
     console.log(`✅ Evaluation completed for ${studentName} (Roll: ${rollNo})`);
-    console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
+    console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.maxPossibleScore || evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
+    
+    // Clean up PENDING_ files by renaming them to EVALUATED_
+    if (pagesToProcess.some(page => page.fileId)) {
+      console.log(`🧹 Cleaning up ${pagesToProcess.filter(p => p.fileId).length} pending files...`);
+      
+      for (const page of pagesToProcess) {
+        if (page.fileId && page.fileName && page.fileName.startsWith('pending_')) {
+          try {
+            const evaluatedFileName = page.fileName.replace('pending_', 'evaluated_');
+            await googleDriveService.renameFileInDrive(page.fileId, evaluatedFileName);
+            console.log(`✅ Renamed ${page.fileName} to ${evaluatedFileName}`);
+          } catch (renameError) {
+            console.error(`⚠️ Failed to rename file ${page.fileName}:`, renameError.message);
+            // Continue with evaluation even if rename fails
+          }
+        }
+      }
+    }
     
     res.json({
       success: true,
@@ -1365,9 +1601,12 @@ router.post('/evaluate-pending', async (req, res) => {
       rollNo: rollNo,
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
+      maxPossibleScore: evaluationResult.maxPossibleScore,
       percentage: evaluationResult.percentage,
       evaluationStatus: 'evaluated',
-      fileName: fileName || `DB_Submission_${submissionId}`
+      fileName: pagesToProcess.length > 1 
+        ? `${studentName}_${pagesToProcess.length}_pages_evaluated` 
+        : (fileName || `DB_Submission_${submissionId}`)
     });
     
   } catch (error) {

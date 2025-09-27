@@ -323,41 +323,51 @@ class GeminiService {
             const imageBase64 = imageBuffer.toString('base64');
 
             const prompt = `
-            Analyze this student answer sheet image and identify which answers have been marked/selected.
+            You are an expert at analyzing student answer sheets. Examine this image very carefully to identify ALL marked answers.
+
+            WHAT TO LOOK FOR:
+            - Dark marks, checkmarks (✓, ✔, √), crosses (✗), or circles around options
+            - Filled or shaded bubbles/circles
+            - Any pen or pencil marks that clearly indicate a selected answer
+            - Options that are highlighted, underlined, or emphasized
+            - Look at EVERY question number and its corresponding options (a, b, c, d, etc.)
             
-            Look for:
-            - Checkmarks (✓, ✔, √)
-            - Circles around options
-            - Filled bubbles or checkboxes
-            - Any other markings that indicate a selected answer
-            - MULTIPLE selections for the same question (students may mark multiple options)
+            INSTRUCTIONS:
+            1. Scan the entire image systematically from top to bottom
+            2. For each question number you see, check if any option (a, b, c, d) has been marked
+            3. Be very thorough - even faint marks or partial marks count as selections
+            4. If you see multiple marks for the same question, include ALL of them
+            5. Only skip questions where you see absolutely NO marks at all
             
-            Return ONLY valid JSON with this exact structure:
+            Return ONLY this JSON structure:
             {
               "answers": [
                 {
                   "question": 1,
                   "selectedOption": "a",
                   "selectedOptions": ["a"],
-                  "confidence": "high"
+                  "confidence": "high",
+                  "markType": "checkmark"
                 },
                 {
                   "question": 2,
-                  "selectedOption": "b",
-                  "selectedOptions": ["b", "c"], 
-                  "confidence": "medium"
+                  "selectedOption": "b", 
+                  "selectedOptions": ["b", "c"],
+                  "confidence": "medium",
+                  "markType": "filled_circle"
                 }
               ]
             }
 
-            Rules:
-            - Only include questions where you can clearly see a marked answer
-            - Use confidence levels: "high", "medium", "low" based on how clear the marking is
-            - selectedOption should be the first/primary selected option (lowercase a, b, c, d)
-            - selectedOptions should be an array of ALL marked options for that question
-            - If only one option is marked, selectedOptions should be ["a"] (single item array)
-            - If multiple options are marked, include all of them: ["a", "c", "d"]
-            - Do not include any explanatory text, only the JSON
+            CONFIDENCE LEVELS:
+            - "high": Clear, dark, unmistakable mark
+            - "medium": Visible mark but might be faint
+            - "low": Barely visible or questionable mark
+            
+            MARK TYPES: checkmark, cross, filled_circle, outlined_circle, underline, highlight, scribble
+            
+            CRITICAL: Include EVERY question where you see ANY kind of mark, even if faint. Do not be overly conservative.
+            Return ONLY the JSON, no other text.
             `;
 
             const imagePart = {
