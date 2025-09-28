@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const jwt = require('jsonwebtoken');
+const xlsx = require('xlsx');
 const prisma = require('../prisma');
 const { GeminiService } = require('../../services/geminiService');
 const GoogleDriveService = require('../../services/googleDriveService');
@@ -1663,6 +1664,89 @@ router.post('/reset-to-pending/:submissionId', async (req, res) => {
     res.json({ success: true, message: 'Submission reset to pending status' });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Export submissions to Excel
+router.get('/export-excel/:paperId', async (req, res) => {
+  try {
+    const paperId = parseInt(req.params.paperId);
+    
+    // Get paper details
+    const paper = await prisma.paper.findUnique({
+      where: { id: paperId },
+      select: { name: true }
+    });
+    
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+    
+    // Get all submissions for this paper
+    const submissions = await prisma.studentSubmission.findMany({
+      where: { paperId: paperId },
+      select: {
+        rollNo: true,
+        studentName: true,
+        score: true,
+        totalQuestions: true,
+        evaluationStatus: true,
+        submittedAt: true
+      },
+      orderBy: { rollNo: 'asc' }
+    });
+
+    // Get paper details for total marks
+    const paperDetails = await prisma.paper.findUnique({
+      where: { id: paperId },
+      select: { totalMarks: true }
+    });
+
+    const totalMarks = paperDetails?.totalMarks || null;
+    
+    // Prepare Excel data
+    const excelData = submissions.map(submission => {
+      let scoreStatus;
+      
+      if (submission.evaluationStatus === 'evaluated') {
+        // Use totalMarks from paper if available, otherwise fall back to totalQuestions
+        const maxScore = totalMarks || submission.totalQuestions;
+        scoreStatus = `${submission.score}/${maxScore}`;
+      } else {
+        scoreStatus = 'not evaluated';
+      }
+      
+      return {
+        'Roll No': submission.rollNo,
+        'Name': submission.studentName,
+        [paper.name]: scoreStatus
+      };
+    });
+    
+    // Create workbook and worksheet
+    const workbook = xlsx.utils.book_new();
+    const worksheet = xlsx.utils.json_to_sheet(excelData);
+    
+    // Add worksheet to workbook
+    xlsx.utils.book_append_sheet(workbook, worksheet, 'Submissions');
+    
+    // Generate Excel buffer
+    const excelBuffer = xlsx.write(workbook, { 
+      bookType: 'xlsx', 
+      type: 'buffer' 
+    });
+    
+    // Set headers for file download
+    const fileName = `${paper.name.replace(/[^a-zA-Z0-9]/g, '_')}_submissions.xlsx`;
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    
+    // Send the Excel file
+    res.send(excelBuffer);
+    
+  } catch (error) {
+    console.error('Error exporting submissions to Excel:', error);
+    res.status(500).json({ error: 'Failed to export submissions to Excel' });
   }
 });
 
