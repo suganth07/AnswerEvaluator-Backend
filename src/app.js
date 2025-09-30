@@ -17,8 +17,29 @@ app.use("/api/questions", require("./routes/questions"));
 app.use("/api/manual-tests", require("./routes/manual-tests"));
 
 // Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({ status: "OK", message: "Answer Evaluator API is running" });
+app.get("/health", async (req, res) => {
+  try {
+    const MinIOService = require("../services/minioService");
+    const minioService = new MinIOService();
+    
+    // Test MinIO connection
+    const bucketExists = await minioService.minioClient.bucketExists(minioService.bucketName);
+    
+    res.json({ 
+      status: "OK", 
+      message: "Answer Evaluator API is running",
+      services: {
+        minio: bucketExists ? "Connected" : "Bucket not found",
+        api: "Running"
+      }
+    });
+  } catch (error) {
+    res.status(503).json({ 
+      status: "Error", 
+      message: "Health check failed",
+      error: error.message 
+    });
+  }
 });
 
 // Error handling middleware

@@ -5,17 +5,17 @@ const jwt = require('jsonwebtoken');
 const xlsx = require('xlsx');
 const prisma = require('../prisma');
 const { GeminiService } = require('../../services/geminiService');
-const GoogleDriveService = require('../../services/googleDriveService');
+const MinIOService = require('../../services/minioService');
 const OMRService = require('../../services/omrService');
 const { FillBlanksService } = require('../../services/fillBlanksService');
 
 const router = express.Router();
 const geminiService = new GeminiService();
-const googleDriveService = new GoogleDriveService();
+const minioService = new MinIOService();
 const omrService = new OMRService();
 const fillBlanksService = require('../../services/fillBlanksService');
 
-// Configure multer for memory storage (student uploads - save to Drive only)
+// Configure multer for memory storage (student uploads - save to MinIO only)
 const storage = multer.memoryStorage();
 
 const upload = multer({ 
@@ -559,8 +559,8 @@ router.post('/submit', uploadAnswer, async (req, res) => {
 
     console.log(`✓ Page count validation passed: ${files.length}/${expectedPages} pages`);
 
-    // Step 1: Upload all answer sheets to Google Drive with roll number naming
-    console.log('📤 Step 1: Uploading answer sheets to Google Drive...');
+    // Step 1: Upload all answer sheets to MinIO with roll number naming
+    console.log('📤 Step 1: Uploading answer sheets to MinIO...');
     const uploadedImages = [];
     
     try {
@@ -575,7 +575,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
         
         console.log(`📤 Uploading page ${pageNumber}: ${fileName}`);
         
-        const uploadResult = await googleDriveService.uploadTempAnswerSheet(
+        const uploadResult = await minioService.uploadTempAnswerSheet(
           file.buffer,
           fileName,
           `${studentName} - Roll: ${rollNo}`,
@@ -594,18 +594,18 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       
       console.log(`✓ All ${files.length} pages uploaded successfully`);
       
-    } catch (driveError) {
-      console.error('❌ Failed to upload to Google Drive:', driveError);
+    } catch (minioError) {
+      console.error('❌ Failed to upload to MinIO:', minioError);
       return res.status(500).json({ 
-        error: 'Failed to upload answer sheet to Google Drive: ' + driveError.message 
+        error: 'Failed to upload answer sheet to MinIO: ' + minioError.message 
       });
     }
 
     // Step 2: Store submission in database WITHOUT evaluation (pending status)
     console.log('� Step 2: Storing submission in database (pending evaluation)...');
     
-    // Create image URLs string from uploaded images
-    const imageUrls = uploadedImages.map(img => img.webViewLink).join(',');
+    // Create image URLs string from uploaded images (store object names, not presigned URLs)
+    const imageUrls = uploadedImages.map(img => img.objectName).join(',');
     
     try {
       const submission = await prisma.studentSubmission.create({
@@ -636,10 +636,10 @@ router.post('/submit', uploadAnswer, async (req, res) => {
         submittedAt: submission.submittedAt,
         status: 'pending',
         uploadedPages: uploadedImages.length,
-        driveInfo: {
-          uploadedToDrive: true,
+        minioInfo: {
+          uploadedToMinIO: true,
           processSteps: [
-            '✓ Uploaded to Google Drive',
+            '✓ Uploaded to MinIO',
             '✓ Stored in database with pending status',
             '✓ Awaiting admin evaluation'
           ]
@@ -716,7 +716,7 @@ router.post('/evaluate/:submissionId', async (req, res) => {
     // Get image URLs from submission
     const imageUrls = submission.imageUrl.split(',');
     
-    // Step 1: Download images from Google Drive and process each one
+    // Step 1: Download images from MinIO and process each one
     let allStudentAnswers = [];
     let rollNoFromPaper = null;
     
@@ -727,8 +727,8 @@ router.post('/evaluate/:submissionId', async (req, res) => {
       console.log(`📄 Processing page ${pageNumber}...`);
       
       try {
-        // Download image from Google Drive
-        const imageBuffer = await googleDriveService.downloadImage(imageUrl);
+        // Download image from MinIO
+        const imageBuffer = await minioService.downloadImage(imageUrl);
         
         // Extract roll number from first page if not already extracted
         if (pageNumber === 1) {
@@ -1006,7 +1006,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Get pending files from Google Drive (for new PENDING_ workflow)
+// Get pending files from MinIO (for new PENDING_ workflow)
 router.get('/pending-files/:paperId', async (req, res) => {
   try {
     const paperId = parseInt(req.params.paperId);
@@ -1023,13 +1023,13 @@ router.get('/pending-files/:paperId', async (req, res) => {
     let pendingSubmissions = [];
     
     try {
-      // Get all PENDING_ files from Google Drive
-      const pendingFiles = await googleDriveService.listPendingFiles();
-      console.log(`📋 Found ${pendingFiles.length} total pending files in Google Drive`);
+      // Get all PENDING_ files from MinIO
+      const pendingFiles = await minioService.listPendingFiles();
+      console.log(`📋 Found ${pendingFiles.length} total pending files in MinIO`);
       console.log(`🔍 Filtering for paper: "${paper.name}" (cleaned: "${paper.name.replace(/[^a-zA-Z0-9]/g, '_')}")`);
       
       // Parse file names to extract student info and filter by current paper
-      const pendingFromDrive = pendingFiles
+      const pendingFromMinIO = pendingFiles
         .map(file => {
           // Extract info from pending_{name}_{rollno}_{testname}_{pageno}.png format
           const match = file.name.match(/^pending_(.+?)_(.+?)_(.+?)_(\d+)\.png$/i);
@@ -1054,17 +1054,17 @@ router.get('/pending-files/:paperId', async (req, res) => {
               pageNumber: parseInt(pageNo),
               uploadedAt: file.createdTime,
               paperName: paper.name,
-              source: 'drive'
+              source: 'minio'
             };
           }
           return null;
         })
         .filter(Boolean);
       
-      console.log(`📊 After filtering: ${pendingFromDrive.length} files match paper "${paper.name}"`);
-      pendingSubmissions = pendingFromDrive;
-    } catch (driveError) {
-      console.error('⚠️ Google Drive error (continuing with database only):', driveError.message);
+      console.log(`📊 After filtering: ${pendingFromMinIO.length} files match paper "${paper.name}"`);
+      pendingSubmissions = pendingFromMinIO;
+    } catch (minioError) {
+      console.error('⚠️ MinIO error (continuing with database only):', minioError.message);
     }
     
     // Also get pending submissions from database for this specific paper
@@ -1083,7 +1083,7 @@ router.get('/pending-files/:paperId', async (req, res) => {
       // Convert database submissions to the same format, but filter out duplicates
       const pendingFromDatabase = pendingFromDB
         .filter(submission => {
-          // Check if this submission already exists in Google Drive PENDING_ files
+          // Check if this submission already exists in MinIO PENDING_ files
           const existsInDrive = pendingSubmissions.some(driveSubmission => 
             driveSubmission.studentName === submission.studentName && 
             driveSubmission.rollNo === submission.rollNo
@@ -1288,9 +1288,9 @@ router.post('/evaluate-pending', async (req, res) => {
           continue;
         }
         
-        // Download image from Google Drive using the stored URL
+        // Download image from MinIO using the stored URL
         console.log(`📄 Downloading file from database submission: ${dbSubmission.imageUrl}`);
-        imageBuffer = await googleDriveService.downloadImage(dbSubmission.imageUrl);
+        imageBuffer = await minioService.downloadImage(dbSubmission.imageUrl);
         if (page.pageNumber === 1) existingSubmission = dbSubmission;
       } else {
         // Handle Google Drive PENDING_ file
@@ -1299,8 +1299,8 @@ router.post('/evaluate-pending', async (req, res) => {
           continue;
         }
         
-        console.log(`📄 Downloading file from Google Drive: ${page.fileName}`);
-        imageBuffer = await googleDriveService.downloadImage(page.fileId);
+        console.log(`📄 Downloading file from MinIO: ${page.fileName}`);
+        imageBuffer = await minioService.downloadImage(page.fileId);
       }
       
       // Extract roll number from the first page only
@@ -1555,7 +1555,7 @@ router.post('/evaluate-pending', async (req, res) => {
         const finalFileName = `evaluated_${cleanStudentName}_${cleanRollNo}_${cleanPaperName}_${pageNumber}_${percentage}%.png`;
         console.log(`📝 Final filename: ${finalFileName}`);
         
-        await googleDriveService.renameFile(fileId, finalFileName);
+        await minioService.renameFile(fileId, finalFileName);
         console.log(`✅ Successfully renamed file to: ${finalFileName}`);
       } catch (renameError) {
         console.error('❌ Failed to rename file:', renameError);
@@ -1584,7 +1584,7 @@ router.post('/evaluate-pending', async (req, res) => {
         if (page.fileId && page.fileName && page.fileName.startsWith('pending_')) {
           try {
             const evaluatedFileName = page.fileName.replace('pending_', 'evaluated_');
-            await googleDriveService.renameFileInDrive(page.fileId, evaluatedFileName);
+            await minioService.renameFile(page.fileId, evaluatedFileName);
             console.log(`✅ Renamed ${page.fileName} to ${evaluatedFileName}`);
           } catch (renameError) {
             console.error(`⚠️ Failed to rename file ${page.fileName}:`, renameError.message);
