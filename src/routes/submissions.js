@@ -582,11 +582,14 @@ router.post('/submit', uploadAnswer, async (req, res) => {
           rollNo
         );
         
+        console.log(`🔍 Upload result for page ${pageNumber}:`, JSON.stringify(uploadResult, null, 2));
+        
         uploadedImages.push({
           pageNumber: pageNumber,
           fileName: fileName,
           fileId: uploadResult.fileId,
-          webViewLink: uploadResult.webViewLink
+          webViewLink: uploadResult.webViewLink,
+          objectName: uploadResult.objectName  // Add this field for database storage
         });
         
         console.log(`✓ Page ${pageNumber} uploaded with ID: ${uploadResult.fileId}`);
@@ -606,6 +609,18 @@ router.post('/submit', uploadAnswer, async (req, res) => {
     
     // Create image URLs string from uploaded images (store object names, not presigned URLs)
     const imageUrls = uploadedImages.map(img => img.objectName).join(',');
+    
+    // Debug uploaded images and final URLs
+    console.log(`🔍 Upload summary: ${uploadedImages.length} images uploaded`);
+    uploadedImages.forEach((img, index) => {
+      console.log(`🔍 Image ${index + 1}: objectName="${img.objectName}", fileName="${img.fileName}"`);
+    });
+    console.log(`🔍 Final imageUrls for database: "${imageUrls}"`);
+    
+    if (!imageUrls || imageUrls.trim() === '') {
+      console.error('❌ No valid image URLs to store in database');
+      return res.status(500).json({ error: 'Failed to generate image URLs for database storage' });
+    }
     
     try {
       const submission = await prisma.studentSubmission.create({
@@ -1278,6 +1293,8 @@ router.post('/evaluate-pending', async (req, res) => {
       
       // Handle different sources for each page
       if (source === 'database' && page.submissionId) {
+        let pageImageUrl; // Declare variable for the page image URL
+        
         // Get submission from database
         const dbSubmission = await prisma.studentSubmission.findUnique({
           where: { id: parseInt(page.submissionId) }
@@ -1288,9 +1305,67 @@ router.post('/evaluate-pending', async (req, res) => {
           continue;
         }
         
+        // Check if imageUrl is valid
+        if (!dbSubmission.imageUrl || dbSubmission.imageUrl.trim() === '') {
+          console.error(`❌ Empty imageUrl for submission ${dbSubmission.id}. Attempting to reconstruct...`);
+          
+          // Try to reconstruct the object name based on submission details
+          const cleanName = dbSubmission.studentName.replace(/[^a-zA-Z0-9]/g, '_');
+          const cleanRollNo = dbSubmission.rollNo.replace(/[^a-zA-Z0-9]/g, '_');
+          
+          // Get paper name to reconstruct filename
+          const paper = await prisma.papers.findUnique({
+            where: { id: dbSubmission.paperId }
+          });
+          
+          if (paper) {
+            const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+            const reconstructedObjectName = `pending/pending_${cleanName}_${cleanRollNo}_${cleanTestName}_${page.pageNumber}.png`;
+            
+            console.log(`🔧 Reconstructed object name: ${reconstructedObjectName}`);
+            
+            // Check if this object exists in MinIO
+            try {
+              await minioService.minioClient.statObject(minioService.bucketName, reconstructedObjectName);
+              console.log(`✅ Found object in MinIO: ${reconstructedObjectName}`);
+              
+              // Use the reconstructed object name
+              pageImageUrl = reconstructedObjectName;
+            } catch (statError) {
+              console.error(`❌ Reconstructed object not found: ${reconstructedObjectName}`);
+              continue;
+            }
+          } else {
+            console.error(`❌ Could not find paper ${dbSubmission.paperId} to reconstruct filename`);
+            continue;
+          }
+        } else {
+          // Extract the correct image URL for this page (handle comma-separated URLs)
+          const imageUrls = dbSubmission.imageUrl.split(',').map(url => url.trim());
+          pageImageUrl = imageUrls[page.pageNumber - 1] || imageUrls[0]; // Use first URL if page index not found
+        }
+        
+        if (!pageImageUrl || pageImageUrl.trim() === '') {
+          console.error(`❌ No image URL found for page ${page.pageNumber} in submission ${dbSubmission.id}`);
+          continue;
+        }
+        
         // Download image from MinIO using the stored URL
-        console.log(`📄 Downloading file from database submission: ${dbSubmission.imageUrl}`);
-        imageBuffer = await minioService.downloadImage(dbSubmission.imageUrl);
+        console.log(`📄 Downloading file from database submission (page ${page.pageNumber}): ${pageImageUrl}`);
+        imageBuffer = await minioService.downloadImage(pageImageUrl);
+        
+        // Set fileId for rename operation after evaluation
+        if (!page.fileId) {
+          // Extract object name from stored URL or use as-is if it's already an object name
+          if (pageImageUrl.startsWith('http')) {
+            const url = new URL(pageImageUrl);
+            page.fileId = url.pathname.replace(`/${minioService.bucketName}/`, '');
+          } else {
+            page.fileId = pageImageUrl; // Already an object name
+          }
+          console.log(`🔗 Set fileId for rename: ${page.fileId}`);
+        }
+        
         if (page.pageNumber === 1) existingSubmission = dbSubmission;
       } else {
         // Handle Google Drive PENDING_ file
@@ -1581,13 +1656,23 @@ router.post('/evaluate-pending', async (req, res) => {
       console.log(`🧹 Cleaning up ${pagesToProcess.filter(p => p.fileId).length} pending files...`);
       
       for (const page of pagesToProcess) {
-        if (page.fileId && page.fileName && page.fileName.startsWith('pending_')) {
+        if (page.fileId) {
           try {
-            const evaluatedFileName = page.fileName.replace('pending_', 'evaluated_');
-            await minioService.renameFile(page.fileId, evaluatedFileName);
-            console.log(`✅ Renamed ${page.fileName} to ${evaluatedFileName}`);
+            // Extract fileName from fileId if not set
+            let fileName = page.fileName;
+            if (!fileName && page.fileId) {
+              fileName = page.fileId.split('/').pop(); // Get filename from object path
+            }
+            
+            if (fileName && fileName.startsWith('pending_')) {
+              const evaluatedFileName = fileName.replace('pending_', 'evaluated_');
+              await minioService.renameFile(page.fileId, evaluatedFileName);
+              console.log(`✅ Renamed ${fileName} to ${evaluatedFileName}`);
+            } else {
+              console.log(`ℹ️ Skipping rename for ${fileName || page.fileId} - not a pending file`);
+            }
           } catch (renameError) {
-            console.error(`⚠️ Failed to rename file ${page.fileName}:`, renameError.message);
+            console.error(`⚠️ Failed to rename file ${page.fileName || page.fileId}:`, renameError.message);
             // Continue with evaluation even if rename fails
           }
         }

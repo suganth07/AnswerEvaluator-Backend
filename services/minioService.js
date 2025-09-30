@@ -52,6 +52,7 @@ class MinIOService {
       };
 
       console.log(`📤 Uploading to MinIO: ${objectName}`);
+      console.log(`🔍 Upload details: bucket="${this.bucketName}", objectName="${objectName}", bufferSize=${fileBuffer.length}`);
       
       await this.minioClient.putObject(
         this.bucketName,
@@ -61,6 +62,8 @@ class MinIOService {
         metaData
       );
 
+      console.log(`📤 Upload completed, generating presigned URL...`);
+
       // Generate presigned URL for access (24 hours expiry)
       const presignedUrl = await this.minioClient.presignedGetObject(
         this.bucketName,
@@ -69,15 +72,22 @@ class MinIOService {
       );
 
       console.log(`✅ Successfully uploaded: ${objectName}`);
+      console.log(`🔗 Generated presigned URL: ${presignedUrl}`);
 
-      return {
+      const result = {
         fileId: objectName, // Use object name as fileId
         webViewLink: presignedUrl,
         fileName: fileName,
         objectName: objectName
       };
+      
+      console.log(`🔍 Returning upload result:`, JSON.stringify(result, null, 2));
+      
+      return result;
     } catch (error) {
       console.error('❌ MinIO upload error:', error);
+      console.error('❌ Error stack:', error.stack);
+      console.error('❌ Upload failed for objectName:', objectName);
       throw new Error(`Failed to upload file to MinIO: ${error.message}`);
     }
   }
@@ -89,22 +99,44 @@ class MinIOService {
    */
   async downloadImage(objectNameOrUrl) {
     try {
+      console.log(`🔍 Input for download: "${objectNameOrUrl}"`);
+      
       let objectName = objectNameOrUrl;
       
       // Handle backward compatibility: if it's a presigned URL, extract object name
-      if (objectNameOrUrl.startsWith('http')) {
+      if (objectNameOrUrl && objectNameOrUrl.startsWith('http')) {
         try {
           const url = new URL(objectNameOrUrl);
+          console.log(`🔍 URL pathname: "${url.pathname}"`);
+          console.log(`🔍 Bucket name: "${this.bucketName}"`);
+          
           // Extract object name from MinIO URL path
-          objectName = url.pathname.replace(`/${this.bucketName}/`, '');
-          console.log(`🔄 Converting URL to object name: ${objectName}`);
+          // URL format: /bucket-name/object-path
+          const bucketPrefix = `/${this.bucketName}/`;
+          if (url.pathname.startsWith(bucketPrefix)) {
+            objectName = url.pathname.substring(bucketPrefix.length);
+          } else {
+            // Alternative extraction method
+            const pathParts = url.pathname.split('/').filter(part => part);
+            if (pathParts.length >= 2 && pathParts[0] === this.bucketName) {
+              objectName = pathParts.slice(1).join('/');
+            } else {
+              throw new Error(`URL path doesn't contain bucket name: ${url.pathname}`);
+            }
+          }
+          console.log(`🔄 Extracted object name: "${objectName}"`);
         } catch (urlError) {
           console.error('❌ Failed to parse URL:', urlError);
           throw new Error(`Invalid URL format: ${objectNameOrUrl}`);
         }
       }
       
-      console.log(`📥 Downloading from MinIO: ${objectName}`);
+      // Validate object name
+      if (!objectName || objectName.trim() === '') {
+        throw new Error(`Empty object name provided. Input was: "${objectNameOrUrl}"`);
+      }
+      
+      console.log(`📥 Downloading from MinIO: "${objectName}"`);
       
       const dataStream = await this.minioClient.getObject(this.bucketName, objectName);
       
