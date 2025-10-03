@@ -11,7 +11,7 @@ expo-env.d.ts
 *.meta
 tmp/*
 *.sql
-
+test
 \.minio.sys
 # Native
 .kotlin/
