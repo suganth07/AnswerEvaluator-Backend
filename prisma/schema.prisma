@@ -31,6 +31,7 @@ model Paper {
   admin         Admin               @relation(fields: [adminId], references: [id])
   questions     Question[]
   submissions   StudentSubmission[]
+  images        ImageMetadata[]
 
   @@map("papers")
 }
@@ -68,6 +69,7 @@ model StudentSubmission {
   evaluationStatus String          @default("pending") @map("evaluation_status") @db.VarChar(20)
   rollNo           String          @map("roll_no") @db.VarChar(20)
   answers          StudentAnswer[]
+  images           ImageMetadata[]
   paper            Paper           @relation(fields: [paperId], references: [id], onDelete: Cascade)
 
   @@map("student_submissions")
@@ -90,4 +92,32 @@ model StudentAnswer {
   submission         StudentSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
 
   @@map("student_answers")
+}
+
+model ImageMetadata {
+  id              Int      @id @default(autoincrement())
+  objectName      String   @unique @map("object_name") @db.VarChar(500) // MinIO object path
+  originalName    String   @map("original_name") @db.VarChar(255) // Original filename
+  contentType     String   @default("image/jpeg") @map("content_type") @db.VarChar(100)
+  fileSize        BigInt?  @map("file_size") // File size in bytes
+  bucketName      String   @default("answer-sheets") @map("bucket_name") @db.VarChar(100)
+  category        String   @map("category") @db.VarChar(50) // 'pending', 'evaluated', 'papers'
+  studentName     String?  @map("student_name") @db.VarChar(100)
+  rollNo          String?  @map("roll_no") @db.VarChar(20)
+  paperName       String?  @map("paper_name") @db.VarChar(100)
+  score           Decimal? @map("score") @db.Decimal(5, 2)
+  totalQuestions  Int?     @map("total_questions")
+  percentage      Decimal? @map("percentage") @db.Decimal(5, 2)
+  metadata        Json?    @default("{}") // Additional metadata as JSON
+  uploadedAt      DateTime @default(now()) @map("uploaded_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  
+  // Relations
+  paperId         Int?     @map("paper_id") // Link to paper if it's a paper image
+  submissionId    Int?     @map("submission_id") // Link to submission if it's a student submission
+  
+  paper           Paper?            @relation(fields: [paperId], references: [id], onDelete: SetNull)
+  submission      StudentSubmission? @relation(fields: [submissionId], references: [id], onDelete: SetNull)
+
+  @@map("image_metadata")
 }

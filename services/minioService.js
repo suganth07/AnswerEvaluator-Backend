@@ -1,6 +1,7 @@
 const { Client } = require('minio');
 const crypto = require('crypto');
 const path = require('path');
+const ImageMetadataService = require('./imageMetadataService');
 
 class MinIOService {
   constructor() {
@@ -13,6 +14,7 @@ class MinIOService {
     });
 
     this.bucketName = process.env.MINIO_BUCKET || 'answer-sheets';
+    this.imageMetadataService = new ImageMetadataService();
     
     // Initialize bucket
     this.initializeBucket();
@@ -25,9 +27,42 @@ class MinIOService {
         await this.minioClient.makeBucket(this.bucketName);
         console.log(`✅ MinIO bucket '${this.bucketName}' created successfully`);
       }
+      
+      // Set bucket policy to allow public read access for images
+      const bucketPolicy = {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: { AWS: ['*'] },
+            Action: ['s3:GetObject'],
+            Resource: [`arn:aws:s3:::${this.bucketName}/*`]
+          }
+        ]
+      };
+      
+      try {
+        await this.minioClient.setBucketPolicy(this.bucketName, JSON.stringify(bucketPolicy));
+        console.log(`✅ MinIO bucket policy set for public read access`);
+      } catch (policyError) {
+        console.warn(`⚠️ Could not set bucket policy (MinIO may not support it):`, policyError.message);
+      }
     } catch (error) {
       console.error('❌ Error initializing MinIO bucket:', error.message);
     }
+  }
+
+  /**
+   * Generate public URL for MinIO object
+   * @param {string} objectName - MinIO object name
+   * @returns {string} Public URL
+   */
+  generatePublicUrl(objectName) {
+    const minioEndpoint = process.env.MINIO_ENDPOINT || 'localhost:9000';
+    const useSSL = process.env.MINIO_USE_SSL === 'true';
+    const protocol = useSSL ? 'https' : 'http';
+    
+    return `${protocol}://${minioEndpoint}/${this.bucketName}/${objectName}`;
   }
 
   /**
@@ -62,23 +97,33 @@ class MinIOService {
         metaData
       );
 
-      console.log(`📤 Upload completed, generating presigned URL...`);
+      console.log(`📤 Upload completed, storing metadata in database...`);
 
-      // Generate presigned URL for access (24 hours expiry)
-      const presignedUrl = await this.minioClient.presignedGetObject(
-        this.bucketName,
+      // Store metadata in database
+      const imageMetadata = await this.imageMetadataService.storeImageMetadata({
         objectName,
-        24 * 60 * 60 // 24 hours
-      );
+        originalName: fileName,
+        contentType: 'image/jpeg',
+        fileSize: fileBuffer.length,
+        bucketName: this.bucketName,
+        category: 'pending',
+        studentName,
+        rollNo,
+        metadata: metaData
+      });
+
+      // Generate permanent public URL
+      const publicUrl = this.generatePublicUrl(objectName);
 
       console.log(`✅ Successfully uploaded: ${objectName}`);
-      console.log(`🔗 Generated presigned URL: ${presignedUrl}`);
+      console.log(`🔗 Generated public URL: ${publicUrl}`);
 
       const result = {
         fileId: objectName, // Use object name as fileId
-        webViewLink: presignedUrl,
+        webViewLink: publicUrl,
         fileName: fileName,
-        objectName: objectName
+        objectName: objectName,
+        metadataId: imageMetadata.id
       };
       
       console.log(`🔍 Returning upload result:`, JSON.stringify(result, null, 2));
@@ -87,7 +132,6 @@ class MinIOService {
     } catch (error) {
       console.error('❌ MinIO upload error:', error);
       console.error('❌ Error stack:', error.stack);
-      console.error('❌ Upload failed for objectName:', objectName);
       throw new Error(`Failed to upload file to MinIO: ${error.message}`);
     }
   }
@@ -163,8 +207,42 @@ class MinIOService {
    */
   async listPendingFiles() {
     try {
-      console.log('📋 Listing pending files from MinIO...');
+      console.log('📋 Listing pending files from database...');
       
+      // Get pending images from database
+      const pendingImages = await this.imageMetadataService.getImagesByCategory('pending');
+      
+      const files = pendingImages.map(imageMetadata => ({
+        id: imageMetadata.objectName,
+        name: imageMetadata.originalName,
+        webViewLink: this.generatePublicUrl(imageMetadata.objectName),
+        size: imageMetadata.fileSize ? Number(imageMetadata.fileSize) : 0,
+        lastModified: imageMetadata.uploadedAt,
+        metadata: {
+          studentName: imageMetadata.studentName,
+          rollNo: imageMetadata.rollNo,
+          uploadTime: imageMetadata.uploadedAt,
+          ...imageMetadata.metadata
+        }
+      }));
+
+      console.log(`✅ Found ${files.length} pending files from database`);
+      return files;
+    } catch (error) {
+      console.error('❌ Error listing pending files:', error);
+      
+      // Fallback to direct MinIO listing if database fails
+      console.log('🔄 Falling back to direct MinIO listing...');
+      return this.listPendingFilesFromMinIO();
+    }
+  }
+
+  /**
+   * Fallback method to list files directly from MinIO
+   * @returns {Array} Array of file objects
+   */
+  async listPendingFilesFromMinIO() {
+    try {
       const objects = [];
       const stream = this.minioClient.listObjects(this.bucketName, 'pending/', true);
       
@@ -174,17 +252,13 @@ class MinIOService {
             // Get object metadata
             const stat = await this.minioClient.statObject(this.bucketName, obj.name);
             
-            // Generate presigned URL
-            const presignedUrl = await this.minioClient.presignedGetObject(
-              this.bucketName,
-              obj.name,
-              24 * 60 * 60
-            );
+            // Generate public URL
+            const publicUrl = this.generatePublicUrl(obj.name);
 
             objects.push({
               id: obj.name,
               name: path.basename(obj.name),
-              webViewLink: presignedUrl,
+              webViewLink: publicUrl,
               size: obj.size,
               lastModified: obj.lastModified,
               metadata: stat.metaData || {}
@@ -194,7 +268,7 @@ class MinIOService {
             objects.push({
               id: obj.name,
               name: path.basename(obj.name),
-              webViewLink: null,
+              webViewLink: this.generatePublicUrl(obj.name),
               size: obj.size,
               lastModified: obj.lastModified,
               metadata: {}
@@ -203,7 +277,7 @@ class MinIOService {
         });
         
         stream.on('end', () => {
-          console.log(`✅ Found ${objects.length} pending files`);
+          console.log(`✅ Found ${objects.length} pending files from MinIO`);
           resolve(objects);
         });
         
@@ -237,18 +311,20 @@ class MinIOService {
       // Delete original object
       await this.minioClient.removeObject(this.bucketName, oldObjectName);
       
-      // Generate new presigned URL
-      const presignedUrl = await this.minioClient.presignedGetObject(
-        this.bucketName,
-        newObjectName,
-        24 * 60 * 60
-      );
+      // Update metadata in database
+      await this.imageMetadataService.moveImageMetadata(oldObjectName, newObjectName, {
+        category: 'evaluated',
+        originalName: newFileName
+      });
+      
+      // Generate new public URL
+      const publicUrl = this.generatePublicUrl(newObjectName);
       
       console.log(`✅ File moved successfully to: ${newObjectName}`);
       
       return {
         fileId: newObjectName,
-        webViewLink: presignedUrl,
+        webViewLink: publicUrl,
         fileName: newFileName,
         objectName: newObjectName
       };
@@ -295,19 +371,33 @@ class MinIOService {
         metaData
       );
 
-      const presignedUrl = await this.minioClient.presignedGetObject(
-        this.bucketName,
+      // Store metadata in database
+      const percentage = (score / totalQuestions) * 100;
+      const imageMetadata = await this.imageMetadataService.storeImageMetadata({
         objectName,
-        24 * 60 * 60
-      );
+        originalName: fileName,
+        contentType: 'image/jpeg',
+        fileSize: imageBuffer.length,
+        bucketName: this.bucketName,
+        category: 'evaluated',
+        studentName,
+        paperName,
+        score,
+        totalQuestions,
+        percentage,
+        metadata: metaData
+      });
+
+      const publicUrl = this.generatePublicUrl(objectName);
 
       console.log(`✅ Evaluated sheet uploaded: ${objectName}`);
 
       return {
         fileId: objectName,
-        webViewLink: presignedUrl,
+        webViewLink: publicUrl,
         fileName: fileName,
-        objectName: objectName
+        objectName: objectName,
+        metadataId: imageMetadata.id
       };
     } catch (error) {
       console.error('❌ MinIO final upload error:', error);
@@ -316,17 +406,18 @@ class MinIOService {
   }
 
   /**
-   * Get presigned URL for object
+   * Get public URL for object (replaces presigned URLs)
    * @param {string} objectName - Object name
-   * @param {number} expiry - Expiry in seconds (default 24 hours)
-   * @returns {string} Presigned URL
+   * @param {number} expiry - Expiry in seconds (ignored, kept for backward compatibility)
+   * @returns {string} Public URL
    */
   async getPresignedUrl(objectName, expiry = 24 * 60 * 60) {
     try {
-      return await this.minioClient.presignedGetObject(this.bucketName, objectName, expiry);
+      // Return permanent public URL instead of presigned URL
+      return this.generatePublicUrl(objectName);
     } catch (error) {
-      console.error('❌ Error generating presigned URL:', error);
-      throw new Error(`Failed to generate presigned URL: ${error.message}`);
+      console.error('❌ Error generating public URL:', error);
+      throw new Error(`Failed to generate public URL: ${error.message}`);
     }
   }
 
@@ -338,7 +429,15 @@ class MinIOService {
   async deleteObject(objectName) {
     try {
       await this.minioClient.removeObject(this.bucketName, objectName);
-      console.log(`🗑️ Deleted object: ${objectName}`);
+      
+      // Also remove metadata from database
+      try {
+        await this.imageMetadataService.deleteImageMetadata(objectName);
+      } catch (metaError) {
+        console.warn(`⚠️ Could not delete metadata for ${objectName}:`, metaError.message);
+      }
+      
+      console.log(`🗑️ Deleted object and metadata: ${objectName}`);
       return true;
     } catch (error) {
       console.error('❌ MinIO delete error:', error);
@@ -357,6 +456,106 @@ class MinIOService {
     
     const fileBuffer = fs.readFileSync(filePath);
     return await this.uploadFinalAnswerSheet(fileBuffer, studentName, paperName, marksObtained, totalMarks);
+  }
+
+  /**
+   * Get image metadata service instance
+   * @returns {ImageMetadataService} Image metadata service
+   */
+  getImageMetadataService() {
+    return this.imageMetadataService;
+  }
+
+  /**
+   * Get storage statistics
+   * @returns {Object} Storage statistics
+   */
+  async getStorageStats() {
+    try {
+      const imageStats = await this.imageMetadataService.getImageStats();
+      
+      // Get MinIO bucket stats
+      let bucketStats = null;
+      try {
+        const objectsList = [];
+        const stream = this.minioClient.listObjects(this.bucketName, '', true);
+        
+        bucketStats = await new Promise((resolve, reject) => {
+          stream.on('data', (obj) => objectsList.push(obj));
+          stream.on('end', () => {
+            const totalSize = objectsList.reduce((sum, obj) => sum + obj.size, 0);
+            resolve({
+              totalObjects: objectsList.length,
+              totalSize,
+              bucketName: this.bucketName
+            });
+          });
+          stream.on('error', reject);
+        });
+      } catch (minioError) {
+        console.warn('⚠️ Could not get MinIO bucket stats:', minioError.message);
+      }
+
+      return {
+        database: imageStats,
+        minio: bucketStats
+      };
+    } catch (error) {
+      console.error('❌ Error getting storage stats:', error);
+      throw new Error(`Failed to get storage statistics: ${error.message}`);
+    }
+  }
+
+  /**
+   * Sync metadata between MinIO and database
+   * This method can be used to recover metadata for existing objects
+   * @returns {Object} Sync results
+   */
+  async syncMetadata() {
+    try {
+      console.log('🔄 Starting metadata sync between MinIO and database...');
+      
+      // Get all objects from MinIO
+      const minioObjects = [];
+      const stream = this.minioClient.listObjects(this.bucketName, '', true);
+      
+      const allObjects = await new Promise((resolve, reject) => {
+        stream.on('data', (obj) => minioObjects.push(obj));
+        stream.on('end', () => resolve(minioObjects));
+        stream.on('error', reject);
+      });
+
+      // Get all metadata from database
+      const allCategories = ['pending', 'evaluated', 'papers'];
+      const dbMetadata = [];
+      for (const category of allCategories) {
+        const images = await this.imageMetadataService.getImagesByCategory(category);
+        dbMetadata.push(...images);
+      }
+
+      const dbObjectNames = dbMetadata.map(meta => meta.objectName);
+      const minioObjectNames = minioObjects.map(obj => obj.name);
+
+      // Find objects in MinIO but not in database
+      const missingInDb = minioObjects.filter(obj => !dbObjectNames.includes(obj.name));
+      
+      // Find objects in database but not in MinIO
+      const missingInMinio = dbMetadata.filter(meta => !minioObjectNames.includes(meta.objectName));
+
+      console.log(`📊 Sync results: ${missingInDb.length} missing in DB, ${missingInMinio.length} missing in MinIO`);
+
+      return {
+        totalMinioObjects: minioObjects.length,
+        totalDbMetadata: dbMetadata.length,
+        missingInDatabase: missingInDb.length,
+        missingInMinio: missingInMinio.length,
+        missingInDbObjects: missingInDb.map(obj => obj.name),
+        missingInMinioObjects: missingInMinio.map(meta => meta.objectName)
+      };
+    } catch (error) {
+      console.error('❌ Error during metadata sync:', error);
+      throw new Error(`Failed to sync metadata: ${error.message}`);
+    }
   }
 }
 

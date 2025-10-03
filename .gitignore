@@ -8,7 +8,11 @@ node_modules/
 dist/
 web-build/
 expo-env.d.ts
+*.meta
+tmp/*
+*.sql
 
+\.minio.sys
 # Native
 .kotlin/
 *.orig.*
@@ -41,3 +45,4 @@ uploads/
 
 # Google Drive credentials
 config/google-drive-credentials.json
+prisma/migrations/migration_lock.toml
