@@ -1105,16 +1105,21 @@ router.get('/pending-files/:paperId', async (req, res) => {
           );
           return !existsInDrive; // Only include if not already in Google Drive
         })
-        .map(submission => ({
-          submissionId: submission.id,
-          fileName: `DB_Submission_${submission.id}`,
-          studentName: submission.studentName,
-          rollNo: submission.rollNo,
-          uploadedAt: submission.submittedAt.toISOString(),
-          paperName: paper.name,
-          source: 'database',
-          imageUrl: submission.imageUrl
-        }));
+        .map(submission => {
+          // If imageUrl looks like a MinIO object path, treat it as MinIO source
+          const isMinioObject = submission.imageUrl && submission.imageUrl.startsWith('pending/');
+          return {
+            submissionId: submission.id,
+            fileName: `DB_Submission_${submission.id}`,
+            fileId: isMinioObject ? submission.imageUrl : null, // Extract fileId from imageUrl
+            studentName: submission.studentName,
+            rollNo: submission.rollNo,
+            uploadedAt: submission.submittedAt.toISOString(),
+            paperName: paper.name,
+            source: isMinioObject ? 'minio' : 'database', // Correct source based on imageUrl
+            imageUrl: submission.imageUrl
+          };
+        });
       
       // Combine both sources
       pendingSubmissions = [...pendingSubmissions, ...pendingFromDatabase];
@@ -1239,6 +1244,18 @@ router.post('/evaluate-pending', async (req, res) => {
   try {
     const { fileId, fileName, studentName, rollNo, paperId, submissionId, source, pages } = req.body;
     
+    console.log(`🔍 Evaluation request body:`, JSON.stringify({
+      fileId,
+      fileName,
+      studentName,
+      rollNo,
+      paperId,
+      submissionId,
+      source,
+      pages: pages ? `${pages.length} pages` : 'none',
+      hasImageUrl: !!req.body.imageUrl
+    }, null, 2));
+    
     if (!studentName || !rollNo || !paperId) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -1274,13 +1291,40 @@ router.post('/evaluate-pending', async (req, res) => {
     }
     
     // Handle multi-page or single page submission
-    const pagesToProcess = pages || [{
+    console.log(`🔍 Initial values: fileId=${fileId}, fileName=${fileName}, source=${source}`);
+    
+    let pagesToProcess = pages || [{
       pageNumber: 1,
       fileId: fileId,
       fileName: fileName,
       submissionId: submissionId,
-      imageUrl: source === 'database' ? req.body.imageUrl : null
+      imageUrl: source === 'database' ? req.body.imageUrl : (fileId ? minioService.generatePublicUrl(fileId) : null)
     }];
+    
+    console.log(`🔍 After initial creation:`, pagesToProcess.map(p => ({ 
+      pageNumber: p.pageNumber, 
+      fileId: p.fileId, 
+      imageUrl: p.imageUrl 
+    })));
+    
+    // Ensure all pages have imageUrl set for MinIO sources
+    if (source !== 'database') {
+      console.log(`🔍 Processing non-database source: ${source}`);
+      pagesToProcess = pagesToProcess.map(page => {
+        const newImageUrl = page.fileId ? minioService.generatePublicUrl(page.fileId) : null;
+        console.log(`🔍 Page ${page.pageNumber}: fileId=${page.fileId} -> imageUrl=${newImageUrl}`);
+        return {
+          ...page,
+          imageUrl: newImageUrl
+        };
+      });
+    }
+    
+    console.log(`📄 Pages to process:`, pagesToProcess.map(p => ({ 
+      pageNumber: p.pageNumber, 
+      fileId: p.fileId, 
+      hasImageUrl: !!p.imageUrl 
+    })));
     
     let allStudentAnswers = [];
     let processedPages = 0;

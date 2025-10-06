@@ -236,7 +236,9 @@ class ImageMetadataService {
    * @returns {string} Public URL
    */
   generatePublicUrl(objectName) {
-    const minioEndpoint = process.env.MINIO_ENDPOINT || 'localhost:9000';
+    // Use public endpoint if available, otherwise fall back to regular endpoint
+    const publicEndpoint = process.env.MINIO_PUBLIC_ENDPOINT;
+    const minioEndpoint = publicEndpoint || process.env.MINIO_ENDPOINT || 'localhost:9000';
     const bucketName = process.env.MINIO_BUCKET || 'answer-sheets';
     const useSSL = process.env.MINIO_USE_SSL === 'true';
     const protocol = useSSL ? 'https' : 'http';

@@ -6,8 +6,8 @@ services:
     image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: minio-server
     ports:
-      - "192.168.1.7:9000:9000"   # MinIO API
-      - "192.168.1.7:9001:9001"   # MinIO Console
+      - "10.207.111.32:9000:9000"   # MinIO API
+      - "10.207.111.32:9001:9001"   # MinIO Console
     environment:
       MINIO_ROOT_USER: ROOTUSER
       MINIO_ROOT_PASSWORD: CHANGEME123
@@ -47,10 +47,11 @@ services:
       dockerfile: Dockerfile
     container_name: backend-api
     ports:
-      - "192.168.1.7:3000:3000"
+      - "10.207.111.32:3000:3000"
     environment:
       DATABASE_URL: ${DATABASE_URL}
       MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: 10.207.111.32:9000
       MINIO_ACCESS_KEY: ROOTUSER
       MINIO_SECRET_KEY: CHANGEME123
       MINIO_BUCKET: answer-sheets

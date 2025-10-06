@@ -58,11 +58,15 @@ class MinIOService {
    * @returns {string} Public URL
    */
   generatePublicUrl(objectName) {
-    const minioEndpoint = process.env.MINIO_ENDPOINT || 'localhost:9000';
+    // Use public endpoint if available, otherwise fall back to regular endpoint
+    const publicEndpoint = process.env.MINIO_PUBLIC_ENDPOINT;
+    const minioEndpoint = publicEndpoint || process.env.MINIO_ENDPOINT || 'localhost:9000';
     const useSSL = process.env.MINIO_USE_SSL === 'true';
     const protocol = useSSL ? 'https' : 'http';
     
-    return `${protocol}://${minioEndpoint}/${this.bucketName}/${objectName}`;
+    const url = `${protocol}://${minioEndpoint}/${this.bucketName}/${objectName}`;
+    console.log(`🔗 Generated public URL: ${url}`);
+    return url;
   }
 
   /**
