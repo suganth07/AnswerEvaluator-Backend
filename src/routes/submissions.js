@@ -916,7 +916,7 @@ router.get('/paper/:paperId/status/:status', async (req, res) => {
       where: whereClause,
       include: {
         paper: {
-          select: { name: true }
+          select: { name: true, totalMarks: true }
         }
       },
       orderBy: { submittedAt: 'desc' }
@@ -931,6 +931,7 @@ router.get('/paper/:paperId/status/:status', async (req, res) => {
       imageUrl: submission.imageUrl,
       score: parseFloat(submission.score.toString()), // Convert Decimal to number
       totalQuestions: submission.totalQuestions,
+      totalMarks: submission.paper.totalMarks, // Add total_marks from papers table
       percentage: parseFloat(submission.percentage.toString()), // Convert Decimal to number
       submittedAt: submission.submittedAt,
       evaluationStatus: submission.evaluationStatus,
@@ -957,12 +958,12 @@ router.get('/:id', async (req, res) => {
   try {
     const submissionId = parseInt(req.params.id);
 
-    // Get submission details with paper name
+    // Get submission details with paper name and total marks
     const submission = await prisma.studentSubmission.findUnique({
       where: { id: submissionId },
       include: {
         paper: {
-          select: { name: true }
+          select: { name: true, totalMarks: true }
         },
         answers: {
           orderBy: { questionNumber: 'asc' }
@@ -1012,6 +1013,7 @@ router.get('/:id', async (req, res) => {
     res.json({
       ...submission,
       paper_name: submission.paper.name,
+      total_marks: submission.paper.totalMarks, // Add total_marks from papers table
       maxPossibleScore: maxPossibleScore,
       answers: answersWithQuestions
     });
