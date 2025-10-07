@@ -1,13 +1,55 @@
 version: '3.8'
 
 services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: answer-evaluator-postgres
+    environment:
+      POSTGRES_DB: answer-evaluator
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: evaluator2025
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d answer-evaluator"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # pgAdmin for Database GUI
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: answer-evaluator-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: evaluator2025
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    volumes:
+      - ./pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
   # MinIO Object Storage
   minio:
     image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-    container_name: minio-server
+    container_name: answer-evaluator-minio
     ports:
-      - "10.207.111.32:9000:9000"   # MinIO API
-      - "10.207.111.32:9001:9001"   # MinIO Console
+      - "9000:9000"   # MinIO API
+      - "9001:9001"   # MinIO Console
     environment:
       MINIO_ROOT_USER: ROOTUSER
       MINIO_ROOT_PASSWORD: CHANGEME123
@@ -45,11 +87,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: backend-api
+    container_name: answer-evaluator-backend
     ports:
-      - "10.207.111.32:3000:3000"
+      - "3000:3000"
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: postgresql://postgres:evaluator2025@postgres:5432/answer-evaluator?schema=public
       MINIO_ENDPOINT: minio:9000
       MINIO_PUBLIC_ENDPOINT: 10.207.111.32:9000
       MINIO_ACCESS_KEY: ROOTUSER
@@ -58,14 +100,31 @@ services:
       MINIO_USE_SSL: false
       JWT_SECRET: ${JWT_SECRET}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
-      PORT: ${PORT}
+      PORT: 3000
       ADMIN_USERNAME: ${ADMIN_USERNAME}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      NODE_ENV: production
     depends_on:
-      - minio
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     networks:
       - app-network
     restart: unless-stopped
+    command: >
+      sh -c "
+        echo '🔄 Waiting for database to be ready...' &&
+        sleep 5 &&
+        echo '📦 Installing dependencies...' &&
+        npm install &&
+        echo '🗃️ Running Prisma migrations...' &&
+        npx prisma migrate deploy &&
+        echo '📊 Generating Prisma client...' &&
+        npx prisma generate &&
+        echo '🚀 Starting application...' &&
+        npm start
+      "
 
 networks:
   app-network:

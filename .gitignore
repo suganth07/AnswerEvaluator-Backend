@@ -42,7 +42,12 @@ yarn-error.*
 *.tsbuildinfo
 .env
 uploads/
-
+*.db
+\nul
+*.conf
+postgres-data/
+*.env*
+pgadmin-data/
 # Google Drive credentials
 config/google-drive-credentials.json
 prisma/migrations/migration_lock.toml
