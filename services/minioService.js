@@ -7,7 +7,7 @@ class MinIOService {
   constructor() {
     this.minioClient = new Client({
       endPoint: process.env.MINIO_ENDPOINT?.split(':')[0] || 'localhost',
-      port: parseInt(process.env.MINIO_ENDPOINT?.split(':')[1]) || 9000,
+      port: parseInt(process.env.MINIO_ENDPOINT?.split(':')[1]) || 4656,
       useSSL: process.env.MINIO_USE_SSL === 'true',
       accessKey: process.env.MINIO_ACCESS_KEY || 'ROOTUSER',
       secretKey: process.env.MINIO_SECRET_KEY || 'CHANGEME123',
@@ -60,7 +60,7 @@ class MinIOService {
   generatePublicUrl(objectName) {
     // Use public endpoint if available, otherwise fall back to regular endpoint
     const publicEndpoint = process.env.MINIO_PUBLIC_ENDPOINT;
-    const minioEndpoint = publicEndpoint || process.env.MINIO_ENDPOINT || 'localhost:9000';
+    const minioEndpoint = publicEndpoint || process.env.MINIO_ENDPOINT || 'localhost:4656';
     const useSSL = process.env.MINIO_USE_SSL === 'true';
     const protocol = useSSL ? 'https' : 'http';
     
