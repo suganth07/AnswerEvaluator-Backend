@@ -1881,4 +1881,165 @@ router.get('/export-excel/:paperId', async (req, res) => {
   }
 });
 
+// Batch evaluate all pending submissions for a paper
+router.post('/batch-evaluate/:paperId', async (req, res) => {
+  try {
+    const paperId = parseInt(req.params.paperId);
+    const { delayBetweenEvaluations = 5000, maxRetries = 3 } = req.body;
+
+    console.log(`🚀 Starting batch evaluation for paper ${paperId} with ${delayBetweenEvaluations}ms delay between evaluations`);
+
+    // Get paper details
+    const paper = await prisma.paper.findUnique({
+      where: { id: paperId }
+    });
+
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+
+    // Get all pending submissions for this paper
+    const pendingResponse = await fetch(`${process.env.API_BASE_URL || 'http://localhost:3000'}/api/submissions/pending-files/${paperId}`);
+    if (!pendingResponse.ok) {
+      throw new Error('Failed to fetch pending submissions');
+    }
+
+    const pendingData = await pendingResponse.json();
+    const pendingSubmissions = pendingData.pendingSubmissions || [];
+
+    if (pendingSubmissions.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No pending submissions found',
+        results: { success: 0, failed: 0, errors: [] }
+      });
+    }
+
+    console.log(`📋 Found ${pendingSubmissions.length} pending submissions to evaluate`);
+
+    const results = {
+      success: 0,
+      failed: 0,
+      errors: [],
+      evaluationDetails: []
+    };
+
+    // Process each submission with delay and retry logic
+    for (let i = 0; i < pendingSubmissions.length; i++) {
+      const submission = pendingSubmissions[i];
+      console.log(`🔄 Processing ${i + 1}/${pendingSubmissions.length}: ${submission.studentName}`);
+
+      try {
+        const evaluationResult = await evaluateSubmissionWithRetry(submission, paperId, maxRetries);
+        
+        results.success++;
+        results.evaluationDetails.push({
+          studentName: submission.studentName,
+          rollNo: submission.rollNo,
+          status: 'success',
+          score: evaluationResult.score,
+          maxScore: evaluationResult.maxPossibleScore || evaluationResult.totalQuestions,
+          percentage: evaluationResult.percentage
+        });
+
+        console.log(`✅ Successfully evaluated ${submission.studentName}: ${evaluationResult.score}/${evaluationResult.maxPossibleScore || evaluationResult.totalQuestions} (${evaluationResult.percentage.toFixed(1)}%)`);
+
+      } catch (error) {
+        results.failed++;
+        const errorMessage = `${submission.studentName} (${submission.rollNo}): ${error.message}`;
+        results.errors.push(errorMessage);
+        results.evaluationDetails.push({
+          studentName: submission.studentName,
+          rollNo: submission.rollNo,
+          status: 'failed',
+          error: error.message
+        });
+
+        console.error(`❌ Failed to evaluate ${submission.studentName}:`, error.message);
+      }
+
+      // Add delay between evaluations (except for the last one)
+      if (i < pendingSubmissions.length - 1) {
+        console.log(`⏳ Waiting ${delayBetweenEvaluations}ms before next evaluation...`);
+        await new Promise(resolve => setTimeout(resolve, delayBetweenEvaluations));
+      }
+    }
+
+    console.log(`🎉 Batch evaluation completed. Success: ${results.success}, Failed: ${results.failed}`);
+
+    res.json({
+      success: true,
+      message: `Batch evaluation completed. Successfully evaluated ${results.success}/${pendingSubmissions.length} submissions.`,
+      results: results
+    });
+
+  } catch (error) {
+    console.error('❌ Batch evaluation error:', error);
+    res.status(500).json({ 
+      error: 'Batch evaluation failed: ' + error.message 
+    });
+  }
+});
+
+// Helper function for batch evaluation with retry logic
+async function evaluateSubmissionWithRetry(submission, paperId, maxRetries = 3) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🔄 Attempt ${attempt}/${maxRetries} for ${submission.studentName}`);
+
+      // Prepare request body similar to frontend
+      const requestBody = {
+        paperId: paperId,
+        studentName: submission.studentName,
+        rollNo: submission.rollNo,
+        source: submission.source,
+        ...(submission.totalPages && submission.totalPages > 1 
+          ? { 
+              pages: submission.pages,
+              fileName: `${submission.studentName}_${submission.totalPages}_pages`
+            }
+          : (submission.source === 'drive' || submission.source === 'minio')
+            ? { fileId: submission.fileId, fileName: submission.fileName }
+            : { submissionId: submission.submissionId, imageUrl: submission.imageUrl }
+        )
+      };
+
+      // Call the existing evaluate-pending endpoint internally
+      const response = await fetch(`${process.env.API_BASE_URL || 'http://localhost:3000'}/api/submissions/evaluate-pending`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        return result; // Success
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `HTTP ${response.status}`);
+      }
+
+    } catch (error) {
+      console.error(`❌ Attempt ${attempt} failed for ${submission.studentName}:`, error.message);
+      lastError = error;
+
+      if (attempt < maxRetries) {
+        // Exponential backoff with jitter
+        const baseDelay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+        const jitter = Math.random() * 1000; // Add up to 1s random delay
+        const delay = baseDelay + jitter;
+        
+        console.log(`⏳ Retrying in ${Math.round(delay)}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw lastError || new Error(`Failed after ${maxRetries} attempts`);
+}
+
 module.exports = router;
