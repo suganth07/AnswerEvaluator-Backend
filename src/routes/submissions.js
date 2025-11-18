@@ -516,18 +516,18 @@ const uploadAnswer = (req, res, next) => {
 // Submit student answer sheet
 router.post('/submit', uploadAnswer, async (req, res) => {
   try {
-    const { paperId, studentName, rollNo } = req.body;
+    const { paperId } = req.body;
     const files = req.files || [];
 
-    if (!paperId || !studentName || !rollNo) {
-      return res.status(400).json({ error: 'Paper ID, student name, and roll number are required' });
+    if (!paperId) {
+      return res.status(400).json({ error: 'Paper ID is required' });
     }
 
     if (files.length === 0) {
       return res.status(400).json({ error: 'Answer sheet image(s) are required' });
     }
 
-    console.log(`🎓 Student submission: ${studentName} (Roll: ${rollNo}) - ${files.length} file(s)`);
+    console.log(`🎓 Student submission: File Upload - ${files.length} file(s)`);
 
     // Check if paper exists and get its page count and question type
     const paper = await prisma.paper.findUnique({
@@ -559,7 +559,7 @@ router.post('/submit', uploadAnswer, async (req, res) => {
 
     console.log(`✓ Page count validation passed: ${files.length}/${expectedPages} pages`);
 
-    // Step 1: Upload all answer sheets to MinIO with roll number naming
+    // Step 1: Upload all answer sheets to MinIO with default naming
     console.log('📤 Step 1: Uploading answer sheets to MinIO...');
     const uploadedImages = [];
     
@@ -567,19 +567,17 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const pageNumber = i + 1;
-        // Use exact format: {pending}_{name}_{rollno}_{testname}_{pageno}.png
-        const cleanName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
-        const cleanRollNo = rollNo.replace(/[^a-zA-Z0-9]/g, '_');
+        // Use default format: pending_file_submission_testname_pageno.png
         const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
-        const fileName = `pending_${cleanName}_${cleanRollNo}_${cleanTestName}_${pageNumber}.png`;
+        const fileName = `pending_file_submission_${cleanTestName}_${pageNumber}.png`;
         
         console.log(`📤 Uploading page ${pageNumber}: ${fileName}`);
         
         const uploadResult = await minioService.uploadTempAnswerSheet(
           file.buffer,
           fileName,
-          `${studentName} - Roll: ${rollNo}`,
-          rollNo
+          `File Submission`,
+          'unknown'
         );
         
         console.log(`🔍 Upload result for page ${pageNumber}:`, JSON.stringify(uploadResult, null, 2));
@@ -626,8 +624,8 @@ router.post('/submit', uploadAnswer, async (req, res) => {
       const submission = await prisma.studentSubmission.create({
         data: {
           paperId: parseInt(paperId),
-          studentName: studentName,
-          rollNo: rollNo,
+          studentName: "File Submission",
+          rollNo: "unknown",
           imageUrl: imageUrls,
           score: 0,
           totalQuestions: 0,
@@ -646,8 +644,8 @@ router.post('/submit', uploadAnswer, async (req, res) => {
         success: true,
         message: 'Answer sheet submitted successfully and is pending evaluation',
         submissionId: submission.id,
-        studentName: studentName,
-        rollNo: rollNo,
+        studentName: "File Submission",
+        rollNo: "unknown",
         submittedAt: submission.submittedAt,
         status: 'pending',
         uploadedPages: uploadedImages.length,
@@ -1048,10 +1046,10 @@ router.get('/pending-files/:paperId', async (req, res) => {
       // Parse file names to extract student info and filter by current paper
       const pendingFromMinIO = pendingFiles
         .map(file => {
-          // Extract info from pending_{name}_{rollno}_{testname}_{pageno}.png format
-          const match = file.name.match(/^pending_(.+?)_(.+?)_(.+?)_(\d+)\.png$/i);
+          // Extract info from pending_file_submission_{testname}_{pageno}.png format
+          const match = file.name.match(/^pending_file_submission_(.+?)_(\d+)\.png$/i);
           if (match) {
-            const [, name, rollNo, testName, pageNo] = match;
+            const [, testName, pageNo] = match;
             
             // Clean the current paper name the same way it's cleaned during upload
             const cleanCurrentPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1065,8 +1063,8 @@ router.get('/pending-files/:paperId', async (req, res) => {
             return {
               fileId: file.id,
               fileName: file.name,
-              studentName: name.replace(/_/g, ' '),
-              rollNo: rollNo.replace(/_/g, ' '),
+              studentName: "File Submission",
+              rollNo: "unknown", // Will be extracted from image during evaluation
               testName: testName.replace(/_/g, ' '),
               pageNumber: parseInt(pageNo),
               uploadedAt: file.createdTime,
@@ -1087,6 +1085,23 @@ router.get('/pending-files/:paperId', async (req, res) => {
     // Also get pending submissions from database for this specific paper
     try {
       console.log(`🗄️  Checking database for pending submissions for paper ID: ${paperId}`);
+      
+      // First, get all evaluated submissions for this paper to exclude them
+      const evaluatedSubmissions = await prisma.studentSubmission.findMany({
+        where: {
+          paperId: paperId,
+          evaluationStatus: 'evaluated'
+        },
+        select: {
+          studentName: true,
+          rollNo: true,
+          imageUrl: true
+        }
+      });
+      
+      console.log(`📋 Found ${evaluatedSubmissions.length} already evaluated submissions for this paper`);
+      
+      // Get actual pending submissions
       const pendingFromDB = await prisma.studentSubmission.findMany({
         where: {
           paperId: paperId,
@@ -1096,6 +1111,31 @@ router.get('/pending-files/:paperId', async (req, res) => {
       });
       
       console.log(`📊 Found ${pendingFromDB.length} pending database submissions for this paper`);
+      
+      // Filter out MinIO files that correspond to already evaluated submissions
+      pendingSubmissions = pendingSubmissions.filter(minioSubmission => {
+        const alreadyEvaluated = evaluatedSubmissions.some(evaluated => {
+          // Check if this MinIO file corresponds to an already evaluated submission
+          // by checking if the imageUrl contains the same file names
+          if (evaluated.imageUrl) {
+            const evaluatedFileNames = evaluated.imageUrl.split(',').map(url => {
+              // Extract filename from URL or path
+              return url.trim().split('/').pop() || '';
+            });
+            
+            return evaluatedFileNames.some(fileName => {
+              return fileName === minioSubmission.fileName || minioSubmission.fileName.includes(fileName);
+            });
+          }
+          return false;
+        });
+        
+        if (alreadyEvaluated) {
+          console.log(`📋 Filtering out already evaluated file: ${minioSubmission.fileName}`);
+        }
+        
+        return !alreadyEvaluated;
+      });
       
       // Convert database submissions to the same format, but filter out duplicates
       const pendingFromDatabase = pendingFromDB
@@ -1129,14 +1169,24 @@ router.get('/pending-files/:paperId', async (req, res) => {
       console.error('⚠️ Database error:', dbError.message);
     }
     
-    // Group multi-page submissions by student (rollNo + studentName)
+    // Group multi-page submissions by paper and base filename (without page number)
     const groupedSubmissions = new Map();
     
     pendingSubmissions.forEach(submission => {
-      const studentKey = `${submission.rollNo}_${submission.studentName}`;
+      // For new file submissions, group by paper and base timestamp
+      // Extract base filename without page number for grouping
+      let groupKey;
+      if (submission.fileName && submission.fileName.includes('file_submission')) {
+        // For new format: pending_file_submission_{testname}_{pageno}.png
+        const baseFileName = submission.fileName.replace(/_\d+\.png$/i, '');
+        groupKey = `${submission.paperName}_${baseFileName}`;
+      } else {
+        // For old format: use rollNo + studentName
+        groupKey = `${submission.rollNo}_${submission.studentName}`;
+      }
       
-      if (!groupedSubmissions.has(studentKey)) {
-        groupedSubmissions.set(studentKey, {
+      if (!groupedSubmissions.has(groupKey)) {
+        groupedSubmissions.set(groupKey, {
           studentName: submission.studentName,
           rollNo: submission.rollNo,
           paperName: submission.paperName,
@@ -1152,7 +1202,7 @@ router.get('/pending-files/:paperId', async (req, res) => {
         });
       }
       
-      const group = groupedSubmissions.get(studentKey);
+      const group = groupedSubmissions.get(groupKey);
       
       // Add page information
       if (submission.pageNumber) {
@@ -1244,13 +1294,11 @@ const retryDatabaseOperation = async (operation, maxRetries = 3, delay = 1000) =
 // Evaluate a PENDING_ file (new workflow) - now supports multi-page submissions
 router.post('/evaluate-pending', async (req, res) => {
   try {
-    const { fileId, fileName, studentName, rollNo, paperId, submissionId, source, pages } = req.body;
+    const { fileId, fileName, paperId, submissionId, source, pages } = req.body;
     
     console.log(`🔍 Evaluation request body:`, JSON.stringify({
       fileId,
       fileName,
-      studentName,
-      rollNo,
       paperId,
       submissionId,
       source,
@@ -1258,11 +1306,11 @@ router.post('/evaluate-pending', async (req, res) => {
       hasImageUrl: !!req.body.imageUrl
     }, null, 2));
     
-    if (!studentName || !rollNo || !paperId) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!paperId) {
+      return res.status(400).json({ error: 'Missing required field: paperId' });
     }
     
-    console.log(`🎓 Starting evaluation for ${source || 'PENDING'} submission: ${studentName} (${rollNo})`);
+    console.log(`🎓 Starting evaluation for ${source || 'PENDING'} submission`);
     console.log(`📄 Processing ${pages ? pages.length : 1} page(s)`);
     
     // Get paper and questions
@@ -1279,29 +1327,86 @@ router.post('/evaluate-pending', async (req, res) => {
       orderBy: { questionNumber: 'asc' }
     });
     
-    // Check if submission already exists for this student and paper
-    let existingSubmission = await prisma.studentSubmission.findFirst({
-      where: {
-        paperId: parseInt(paperId),
-        rollNo: rollNo,
-        studentName: studentName
+    // For submissions from database, find existing submission by ID instead of roll number
+    let existingSubmission = null;
+    if (submissionId) {
+      existingSubmission = await prisma.studentSubmission.findFirst({
+        where: {
+          id: parseInt(submissionId),
+          paperId: parseInt(paperId)
+        }
+      });
+      
+      if (existingSubmission && existingSubmission.evaluationStatus === 'evaluated') {
+        return res.status(400).json({ error: 'This submission has already been evaluated' });
       }
-    });
-    
-    if (existingSubmission && existingSubmission.evaluationStatus === 'evaluated') {
-      return res.status(400).json({ error: 'Student already has an evaluated submission for this paper' });
+    } else {
+      // For MinIO file submissions, try to find existing submission by imageUrl pattern
+      // This handles the case where files were uploaded and a submission was created
+      console.log(`🔍 Looking for existing submission for paperId: ${paperId}`);
+      
+      const recentSubmissions = await prisma.studentSubmission.findMany({
+        where: {
+          paperId: parseInt(paperId),
+          studentName: "File Submission",
+          evaluationStatus: 'pending'
+        },
+        orderBy: { submittedAt: 'desc' },
+        take: 10 // Check recent submissions
+      });
+      
+      console.log(`📊 Found ${recentSubmissions.length} recent pending submissions`);
+      
+      // Try to match by similar file patterns or recent timing
+      if (recentSubmissions.length > 0) {
+        // Use the most recent pending submission for this paper
+        existingSubmission = recentSubmissions[0];
+        console.log(`🎯 Using existing submission ID: ${existingSubmission.id}`);
+      }
     }
     
     // Handle multi-page or single page submission
     console.log(`🔍 Initial values: fileId=${fileId}, fileName=${fileName}, source=${source}`);
     
-    let pagesToProcess = pages || [{
-      pageNumber: 1,
-      fileId: fileId,
-      fileName: fileName,
-      submissionId: submissionId,
-      imageUrl: source === 'database' ? req.body.imageUrl : (fileId ? minioService.generatePublicUrl(fileId) : null)
-    }];
+    let pagesToProcess;
+    
+    if (pages && pages.length > 0) {
+      // Use provided pages array
+      pagesToProcess = pages;
+    } else if (source === 'database' && req.body.imageUrl) {
+      // For database submissions, check if imageUrl contains multiple URLs (comma-separated)
+      const imageUrls = req.body.imageUrl.split(',').map(url => url.trim()).filter(url => url);
+      
+      if (imageUrls.length > 1) {
+        // Multi-page database submission - create separate page objects
+        pagesToProcess = imageUrls.map((url, index) => ({
+          pageNumber: index + 1,
+          fileId: url, // For database submissions, fileId is the object name
+          fileName: fileName || `page_${index + 1}`,
+          submissionId: submissionId,
+          imageUrl: url
+        }));
+        console.log(`🔍 Created ${imageUrls.length} pages for multi-page database submission`);
+      } else {
+        // Single page database submission
+        pagesToProcess = [{
+          pageNumber: 1,
+          fileId: fileId || imageUrls[0],
+          fileName: fileName,
+          submissionId: submissionId,
+          imageUrl: imageUrls[0] || req.body.imageUrl
+        }];
+      }
+    } else {
+      // Default single page for MinIO submissions
+      pagesToProcess = [{
+        pageNumber: 1,
+        fileId: fileId,
+        fileName: fileName,
+        submissionId: submissionId,
+        imageUrl: fileId ? minioService.generatePublicUrl(fileId) : null
+      }];
+    }
     
     console.log(`🔍 After initial creation:`, pagesToProcess.map(p => ({ 
       pageNumber: p.pageNumber, 
@@ -1355,10 +1460,7 @@ router.post('/evaluate-pending', async (req, res) => {
         if (!dbSubmission.imageUrl || dbSubmission.imageUrl.trim() === '') {
           console.error(`❌ Empty imageUrl for submission ${dbSubmission.id}. Attempting to reconstruct...`);
           
-          // Try to reconstruct the object name based on submission details
-          const cleanName = dbSubmission.studentName.replace(/[^a-zA-Z0-9]/g, '_');
-          const cleanRollNo = dbSubmission.rollNo.replace(/[^a-zA-Z0-9]/g, '_');
-          
+          // Try to reconstruct the object name based on new default format
           // Get paper name to reconstruct filename
           const paper = await prisma.papers.findUnique({
             where: { id: dbSubmission.paperId }
@@ -1366,7 +1468,7 @@ router.post('/evaluate-pending', async (req, res) => {
           
           if (paper) {
             const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
-            const reconstructedObjectName = `pending/pending_${cleanName}_${cleanRollNo}_${cleanTestName}_${page.pageNumber}.png`;
+            const reconstructedObjectName = `pending/pending_file_submission_${cleanTestName}_${page.pageNumber}.png`;
             
             console.log(`🔧 Reconstructed object name: ${reconstructedObjectName}`);
             
@@ -1424,32 +1526,23 @@ router.post('/evaluate-pending', async (req, res) => {
         imageBuffer = await minioService.downloadImage(page.fileId);
       }
       
-      // Extract roll number from the first page only
+      // Extract roll number from the first page for display purposes
       if (page.pageNumber === 1) {
-        console.log('🔍 Extracting roll number from question paper...');
+        console.log('🔍 Extracting roll number from question paper for display...');
         let rollNoFromPaper = null;
         
         try {
           const rollNoResult = await geminiService.extractRollNumberFromImage(imageBuffer);
           if (rollNoResult.success) {
             rollNoFromPaper = rollNoResult.rollNumber;
-            console.log(`📋 Roll number from paper: ${rollNoFromPaper}`);
+            console.log(`📋 Roll number extracted from paper: ${rollNoFromPaper}`);
+            
+            // Store extracted roll number for later use in submission data
+            page.extractedRollNo = rollNoFromPaper;
           }
         } catch (rollError) {
           console.error('⚠️ Roll number extraction failed:', rollError.message);
-          // Continue without roll number validation
-        }
-        
-        // Validate roll number
-        if (rollNoFromPaper && rollNoFromPaper !== rollNo) {
-          console.log(`❌ Roll number mismatch: Paper shows ${rollNoFromPaper}, but file indicates ${rollNo}`);
-          
-          return res.status(400).json({ 
-            error: 'Roll number mismatch',
-            message: `The roll number in the question paper (${rollNoFromPaper}) does not match the roll number in the file name (${rollNo})`,
-            paperRollNo: rollNoFromPaper,
-            fileRollNo: rollNo
-          });
+          // Continue without roll number - not blocking
         }
       }
       
@@ -1570,14 +1663,14 @@ router.post('/evaluate-pending', async (req, res) => {
     
     const submissionData = {
       paperId: parseInt(paperId),
-      studentName: studentName,
-      rollNo: rollNo,
+      studentName: "File Submission",
+      rollNo: pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || "unknown",
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
       percentage: evaluationResult.percentage,
       evaluationStatus: 'evaluated',
       evaluationMethod: `pending_file_${evaluationResult.evaluationMethod || 'traditional'}`,
-      imageUrl: source === 'database' ? existingSubmission.imageUrl : fileId,
+      imageUrl: source === 'database' ? existingSubmission.imageUrl : pagesToProcess.map(p => p.fileId || p.fileName).join(','),
       answerTypes: evaluationResult.answerTypes || {},
       submittedAt: existingSubmission ? existingSubmission.submittedAt : new Date()
     };
@@ -1653,11 +1746,12 @@ router.post('/evaluate-pending', async (req, res) => {
     if (source !== 'database' && fileId) {
       try {
         console.log(`🔄 Attempting to rename file - Source: ${source}, FileId: ${fileId}`);
-        console.log(`📝 Student: ${studentName}, Roll: ${rollNo}, Paper: ${paper.name}`);
+        const extractedRollNo = pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || 'unknown';
+        console.log(`📝 File Submission, Roll: ${extractedRollNo}, Paper: ${paper.name}`);
         
         // Clean up the filename to avoid special characters
-        const cleanStudentName = studentName.replace(/[^a-zA-Z0-9]/g, '_');
-        const cleanRollNo = rollNo.replace(/[^a-zA-Z0-9]/g, '_');
+        const cleanStudentName = "file_submission";
+        const cleanRollNo = extractedRollNo.replace(/[^a-zA-Z0-9]/g, '_');
         const cleanPaperName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
         const score = evaluationResult.score;
         const total = evaluationResult.totalQuestions;
@@ -1666,14 +1760,23 @@ router.post('/evaluate-pending', async (req, res) => {
         // Extract page number from the original filename if it exists
         let pageNumber = '1'; // default page
         if (fileName) {
-          const pageMatch = fileName.match(/pending_.+_.+_.+_(\d+)\.png$/i);
-          if (pageMatch) {
-            pageNumber = pageMatch[1];
+          // Check for new format: pending_file_submission_testname_page.png
+          const newFormatMatch = fileName.match(/pending_file_submission_.+_(\d+)\.png$/i);
+          // Check for old format: pending_name_rollno_testname_page.png
+          const oldFormatMatch = fileName.match(/pending_.+_.+_.+_(\d+)\.png$/i);
+          
+          if (newFormatMatch) {
+            pageNumber = newFormatMatch[1];
+          } else if (oldFormatMatch) {
+            pageNumber = oldFormatMatch[1];
           }
         }
         
         // Use exact format: {evaluated}_{name}_{rollno}_{testname}_{pageno}_{score%}.png
-        const finalFileName = `evaluated_${cleanStudentName}_${cleanRollNo}_${cleanPaperName}_${pageNumber}_${percentage}%.png`;
+        // Use extracted roll number from AI or fallback
+        const displayRollNo = pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || 'unknown';
+        const cleanDisplayRollNo = displayRollNo.replace(/[^a-zA-Z0-9]/g, '_');
+        const finalFileName = `evaluated_file_submission_${cleanDisplayRollNo}_${cleanPaperName}_${pageNumber}_${percentage}%.png`;
         console.log(`📝 Final filename: ${finalFileName}`);
         
         await minioService.renameFile(fileId, finalFileName);
@@ -1683,8 +1786,7 @@ router.post('/evaluate-pending', async (req, res) => {
         console.error('❌ Rename error details:', {
           source,
            fileId,
-          studentName,
-          rollNo,
+          extractedRollNo: pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || 'unknown',
           paperName: paper.name,
           error: renameError.message
         });
@@ -1694,7 +1796,7 @@ router.post('/evaluate-pending', async (req, res) => {
       console.log(`ℹ️ Skipping file rename - Source: ${source}, FileId: ${fileId}`);
     }
     
-    console.log(`✅ Evaluation completed for ${studentName} (Roll: ${rollNo})`);
+    console.log(`✅ Evaluation completed for File Submission (Roll: ${pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || 'unknown'})`);
     console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.maxPossibleScore || evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
     
     // Clean up PENDING_ files by renaming them to EVALUATED_
@@ -1729,15 +1831,15 @@ router.post('/evaluate-pending', async (req, res) => {
       success: true,
       message: 'Evaluation completed successfully',
       submissionId: submission.id,
-      studentName: studentName,
-      rollNo: rollNo,
+      studentName: "File Submission",
+      rollNo: pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || "unknown",
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
       maxPossibleScore: evaluationResult.maxPossibleScore,
       percentage: evaluationResult.percentage,
       evaluationStatus: 'evaluated',
       fileName: pagesToProcess.length > 1 
-        ? `${studentName}_${pagesToProcess.length}_pages_evaluated` 
+        ? `file_submission_${pagesToProcess.length}_pages_evaluated` 
         : (fileName || `DB_Submission_${submissionId}`)
     });
     
