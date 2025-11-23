@@ -1900,6 +1900,57 @@ router.post('/evaluate-pending', async (req, res) => {
         console.log(`📄 Downloading file from database submission (page ${page.pageNumber}): ${pageImageUrl}`);
         imageBuffer = await minioService.downloadImage(pageImageUrl);
         
+        // Check if this is a PDF file
+        const isPdfFile = pageImageUrl?.endsWith('.pdf') || 
+                         (imageBuffer && imageBuffer.slice(0, 4).toString() === '%PDF');
+        
+        if (isPdfFile) {
+          console.log('📄 Detected PDF file in database submission, processing with PDF service...');
+          
+          try {
+            // First get PDF info to understand structure
+            const pdfInfo = await pdfService.getPDFInfo(imageBuffer);
+            console.log(`📊 Database PDF Info: ${pdfInfo.pages} pages, ${pdfInfo.wordCount} words`);
+            
+            // Use PDF service to extract content directly
+            const pdfResult = await pdfService.extractContentWithGemini(imageBuffer);
+            
+            if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
+              allStudentAnswers.rollNumber = pdfResult.rollNumber;
+              console.log(`📋 Extracted roll number from PDF: ${pdfResult.rollNumber}`);
+            }
+            
+            if (pdfResult.answers && Array.isArray(pdfResult.answers)) {
+              // Convert PDF answers to format expected by evaluation system
+              const pdfAnswers = pdfResult.answers.map(answer => ({
+                question: answer.question,
+                selectedOption: answer.selectedOption,
+                selectedOptions: answer.selectedOptions || [answer.selectedOption],
+                confidence: answer.confidence,
+                markType: answer.markType || 'checkmark',
+                pageNumber: answer.pageNumber || page.pageNumber
+              }));
+              
+              allStudentAnswers = allStudentAnswers.concat(pdfAnswers);
+              console.log(`✅ Extracted ${pdfAnswers.length} answers from ${pdfInfo.pages}-page database PDF`);
+              
+              // Log sample answers for debugging
+              console.log(`📋 Sample database answers:`, pdfAnswers.slice(0, 5).map(a => 
+                `Q${a.question}: ${a.selectedOptions.join(',')} (page ${a.pageNumber})`
+              ));
+            }
+            
+            // Increment processed pages for PDF
+            processedPages++;
+            // Skip the rest of the image processing for this page
+            continue;
+            
+          } catch (pdfError) {
+            console.error('❌ Database PDF processing failed:', pdfError);
+            // Continue to try image processing as fallback
+          }
+        }
+        
         // Set fileId for rename operation after evaluation
         if (!page.fileId) {
           // Extract object name from stored URL or use as-is if it's already an object name
@@ -1924,7 +1975,84 @@ router.post('/evaluate-pending', async (req, res) => {
         imageBuffer = await minioService.downloadImage(page.fileId);
       }
       
-      // Extract roll number from the first page for display purposes
+      // Check if this is a PDF file by checking the file extension or magic bytes
+      const isPdfFile = page.fileId?.endsWith('.pdf') || 
+                       page.fileName?.endsWith('.pdf') ||
+                       (imageBuffer && imageBuffer.slice(0, 4).toString() === '%PDF');
+      
+      if (isPdfFile) {
+        console.log('📄 Detected PDF file, processing with PDF service...');
+        
+        try {
+          // First get PDF info to understand structure
+          const pdfInfo = await pdfService.getPDFInfo(imageBuffer);
+          console.log(`📊 PDF Info: ${pdfInfo.pages} pages, ${pdfInfo.wordCount} words`);
+          
+          // Use PDF service to extract content directly
+          const pdfResult = await pdfService.extractContentWithGemini(imageBuffer);
+          
+          if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
+            allStudentAnswers.rollNumber = pdfResult.rollNumber;
+            console.log(`📋 Extracted roll number from PDF: ${pdfResult.rollNumber}`);
+          }
+          
+          if (pdfResult.answers && Array.isArray(pdfResult.answers)) {
+            // Convert PDF answers to format expected by evaluation system
+            // Handle potential duplicate question numbers from multi-page PDFs
+            const pdfAnswers = pdfResult.answers.map((answer, index) => {
+              let questionNumber = answer.question;
+              
+              // If we have duplicate question numbers, renumber the second set
+              // Check if this is likely a second page by looking at position in array
+              if (pdfResult.answers.length > 10 && index >= 10) {
+                // If this is the 11th+ answer and question number is <= 10, 
+                // it's likely from page 2 and needs renumbering
+                if (questionNumber <= 10) {
+                  questionNumber = questionNumber + 10;
+                  console.log(`📋 Renumbering page 2 Q${answer.question} → Q${questionNumber}`);
+                }
+              }
+              
+              return {
+                question: questionNumber,
+                selectedOption: answer.selectedOption,
+                selectedOptions: answer.selectedOptions || [answer.selectedOption],
+                confidence: answer.confidence,
+                markType: answer.markType || 'checkmark',
+                pageNumber: answer.pageNumber || 1
+              };
+            });
+            
+            allStudentAnswers = allStudentAnswers.concat(pdfAnswers);
+            console.log(`✅ Extracted ${pdfAnswers.length} answers from ${pdfInfo.pages}-page PDF`);
+            
+            // Log detailed answers for debugging
+            console.log(`📋 Detailed PDF answers after renumbering:`, pdfAnswers.map(a => 
+              `Q${a.question}: ${a.selectedOptions.join(',')} (page ${a.pageNumber}) [${a.confidence}]`
+            ));
+            
+            // Log roll number extraction status
+            if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
+              console.log(`✅ Roll number successfully extracted: ${pdfResult.rollNumber}`);
+            } else {
+              console.log(`⚠️ Roll number not found or unclear in PDF`);
+            }
+          } else {
+            console.log(`⚠️ No answers array found in PDF result:`, pdfResult);
+          }
+          
+          // Increment processed pages for PDF
+          processedPages++;
+          // Skip the rest of the image processing for this page
+          continue;
+          
+        } catch (pdfError) {
+          console.error('❌ PDF processing failed:', pdfError);
+          // Continue to try image processing as fallback
+        }
+      }
+      
+      // Extract roll number from the first page for display purposes (image processing)
       if (page.pageNumber === 1) {
         console.log('🔍 Extracting roll number from question paper for display...');
         let rollNoFromPaper = null;

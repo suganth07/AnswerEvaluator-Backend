@@ -229,66 +229,91 @@ class PDFService {
       const pdfBase64 = pdfBuffer.toString('base64');
       
       const prompt = `
-        You are an expert at analyzing MCQ answer sheets from PDF documents. Examine this PDF page very carefully to identify ALL marked answers.
+        You are an expert at analyzing MCQ answer sheets from PDF documents. This is a MULTI-PAGE PDF document that you must analyze completely and dynamically.
 
-        CRITICAL ANALYSIS POINTS:
-        1. ROLL NUMBER: Look for "Roll Number:" field at the top - extract the number (like "48")
-        2. MCQ FORMAT: This is a standard MCQ answer sheet with questions 1-10
-        3. CHECKMARK DETECTION: Look for checkmarks (✓) next to options (a), (b), (c), (d)
-        4. MULTIPLE MARKS: Students often mark multiple options - capture ALL marked options per question
-        5. SYSTEMATIC SCANNING: Go through each question 1, 2, 3... and check which options have checkmarks
+        YOUR TASK:
+        1. Analyze ALL pages in this PDF to understand the structure
+        2. Extract the student's roll number from wherever it appears
+        3. Identify ALL questions and their marked answers across all pages
+        4. Handle multiple pages with proper question numbering
 
-        VISUAL PATTERNS TO DETECT:
-        - Heavy black checkmarks (✓) next to letters like (a)✓, (b)✓, (c)✓, (d)✓  
-        - Both thin and thick checkmark strokes
-        - Checkmarks that may be slightly rotated or styled differently
-        - Multiple checkmarks on the same question line
-        
-        Return ONLY this JSON structure:
+        ROLL NUMBER EXTRACTION:
+        - Look for roll number fields anywhere in the document
+        - Common patterns: "Roll Number:", "Roll No:", "ID:", "Student ID:", "Registration No:"
+        - The number could be handwritten, typed, or in boxes
+        - Extract the complete number as found in the document
+        - If no roll number is visible, return "unknown"
+
+        DYNAMIC QUESTION DETECTION:
+        - Scan ALL pages to find question numbers and their options
+        - Questions may be numbered 1-10, 1-20, Q1-Q10, etc.
+        - Each question typically has options like (a), (b), (c), (d) or A, B, C, D
+        - Determine the actual question numbering pattern from the document
+        - Count how many questions exist on each page
+
+        ANSWER MARK DETECTION:
+        - Look for ANY type of marking that indicates a selected answer:
+          * Checkmarks (✓, ✔, √)
+          * Crosses (✗, ×)
+          * Filled circles or bubbles
+          * Circled letters
+          * Heavy pen marks
+          * Highlighting or underlining
+        - Multiple marks per question are common - capture ALL of them
+        - Even faint or partial marks should be included
+
+        PAGE HANDLING:
+        - If multiple pages exist, determine how questions are distributed
+        - Pages might have: Q1-10 each, or Q1-10 then Q11-20, or other patterns
+        - Renumber questions appropriately if needed to avoid duplicates
+        - Track which page each answer comes from
+
+        RETURN FORMAT - Return ONLY valid JSON:
         {
-          "rollNumber": "48",
-          "extractedContent": "MCQ Answer Sheet Format with questions 1-10",
+          "rollNumber": "extracted_number_or_unknown",
+          "extractedContent": "Description of what was found in the document",
           "answers": [
             {
               "question": 1,
               "selectedOption": "a",
               "selectedOptions": ["a"],
               "confidence": "high",
-              "markType": "checkmark"
+              "markType": "checkmark",
+              "pageNumber": 1
             },
             {
               "question": 3,
-              "selectedOption": "c", 
+              "selectedOption": "c",
               "selectedOptions": ["c", "d"],
               "confidence": "high",
-              "markType": "checkmark"
+              "markType": "checkmark",
+              "pageNumber": 1
             }
           ],
-          "questionCount": 10,
-          "extractionMethod": "gemini_vision",
+          "totalPages": 2,
+          "questionCount": 20,
+          "extractionMethod": "gemini_vision_dynamic",
           "confidence": "high"
         }
-        
-        DETAILED SCANNING INSTRUCTIONS:
-        1. First, locate and extract the roll number from the top section
-        2. Then scan each question line systematically:
-           - Question 1: Check for ✓ next to (a), (b), (c), or (d)
-           - Question 2: Check for ✓ next to (a), (b), (c), or (d)  
-           - Continue through all visible questions
-        3. For each marked option, record it in the answers array
-        4. If multiple options are marked for one question, include all in selectedOptions
-        5. Be extra careful with multiple marks - don't miss any checkmarks
-        
-        CONFIDENCE & MARK TYPE:
-        - confidence: "high" for clear dark checkmarks, "medium" for lighter marks
-        - markType: "checkmark" for ✓ symbols, "cross" for ✗, "fill" for filled circles
-        
+
+        PROCESSING INSTRUCTIONS:
+        1. First scan: Identify document structure, pages, and roll number location
+        2. Second scan: Map all questions and their positions across pages
+        3. Third scan: Detect all marked answers for each identified question
+        4. Renumber questions if multiple pages have overlapping numbers
+        5. Return ALL findings - do not skip questions even if no marks are found
+
         CRITICAL RULES:
-        - selectedOption = first marked option (a, b, c, or d)
-        - selectedOptions = array of ALL marked options ["a", "c"] if both are marked
-        - Include every question that has ANY mark, even if multiple marks
-        - Use exact question numbers as they appear (1, 2, 3, etc.)
-        - Return "unknown" for roll number only if completely unreadable
+        - Extract roll number exactly as it appears (no assumptions)
+        - Find actual question count and numbering from the document
+        - Include every question that has ANY visible mark
+        - selectedOption = first/primary marked option
+        - selectedOptions = array of ALL marked options for that question
+        - pageNumber = which page the question appears on
+        - confidence: "high" for clear marks, "medium" for visible marks, "low" for faint marks
+        - markType: describe the actual type of mark you see
+
+        IMPORTANT: Do not make assumptions about the content. Extract everything dynamically from what you actually see in the PDF.
       `;
       
       const imagePart = {
