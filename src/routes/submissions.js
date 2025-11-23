@@ -8,6 +8,7 @@ const { GeminiService } = require('../../services/geminiService');
 const MinIOService = require('../../services/minioService');
 const OMRService = require('../../services/omrService');
 const { FillBlanksService } = require('../../services/fillBlanksService');
+const pdfService = require('../../services/pdfService');
 
 const router = express.Router();
 const geminiService = new GeminiService();
@@ -29,6 +30,22 @@ const upload = multer({
       cb(null, true);
     } else {
       cb(new Error('Only JPEG and PNG images are allowed'));
+    }
+  }
+});
+
+// Separate multer configuration for PDF files
+const uploadPDF = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 50 * 1024 * 1024 // 50MB limit for PDFs
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['application/pdf'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed'));
     }
   }
 });
@@ -675,6 +692,349 @@ router.post('/submit', uploadAnswer, async (req, res) => {
   }
 });
 
+// PDF Upload Routes
+
+// Single PDF upload route
+router.post('/submit-pdf', uploadPDF.single('answerSheet'), async (req, res) => {
+  try {
+    const { paperId } = req.body;
+    const file = req.file;
+
+    if (!paperId) {
+      return res.status(400).json({ error: 'Paper ID is required' });
+    }
+
+    if (!file) {
+      return res.status(400).json({ error: 'PDF file is required' });
+    }
+
+    // Validate file type
+    if (file.mimetype !== 'application/pdf') {
+      return res.status(400).json({ error: 'Only PDF files are allowed' });
+    }
+
+    console.log(`📄 PDF upload: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
+
+    // Get paper info
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(paperId) }
+    });
+
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+
+    // Validate PDF
+    const pdfInfo = await pdfService.getPDFInfo(file.buffer);
+    if (!pdfInfo.isValid) {
+      return res.status(400).json({ error: 'Invalid PDF file: ' + pdfInfo.error });
+    }
+
+    console.log(`📊 PDF Info: ${pdfInfo.pages} pages, ${(pdfInfo.fileSize / 1024 / 1024).toFixed(2)}MB`);
+
+    // Upload PDF directly to MinIO without processing
+    const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+    const timestamp = Date.now();
+    const fileName = `pending_pdf_${timestamp}_${cleanTestName}.pdf`;
+    
+    console.log(`📤 Uploading PDF: ${fileName}`);
+    
+    const uploadResult = await minioService.uploadTempAnswerSheet(
+      file.buffer,
+      fileName,
+      `PDF Submission - ${file.originalname}`,
+      'unknown'
+    );
+    
+    console.log(`✅ PDF uploaded successfully: ${uploadResult.objectName}`);
+
+    // Create submission record with PDF reference
+    
+    const submission = await prisma.studentSubmission.create({
+      data: {
+        paperId: parseInt(paperId),
+        studentName: "PDF Submission",
+        rollNo: "unknown",
+        imageUrl: uploadResult.objectName, // Store PDF object name
+        score: 0,
+        totalQuestions: 0,
+        percentage: 0,
+        submittedAt: new Date(),
+        answerTypes: {},
+        evaluationMethod: 'pdf_pending',
+        evaluationStatus: 'pending'
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'PDF submitted successfully and stored for evaluation',
+      submission: {
+        id: submission.id,
+        paperId: submission.paperId,
+        studentName: submission.studentName,
+        rollNo: submission.rollNo,
+        submittedAt: submission.submittedAt,
+        evaluationStatus: submission.evaluationStatus,
+        evaluationMethod: submission.evaluationMethod
+      },
+      fileName: fileName,
+      fileSize: (file.size / 1024 / 1024).toFixed(2) + 'MB',
+      pdfInfo: {
+        pages: pdfInfo.pages,
+        isValid: pdfInfo.isValid,
+        originalFileName: file.originalname
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ PDF submission error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process PDF submission: ' + error.message 
+    });
+  }
+});
+
+// Bulk PDF upload route
+router.post('/submit-bulk-pdf', uploadPDF.array('pdfFiles'), async (req, res) => {
+  try {
+    const { paperId } = req.body;
+    const files = req.files;
+
+    if (!paperId) {
+      return res.status(400).json({ error: 'Paper ID is required' });
+    }
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'At least one PDF file is required' });
+    }
+
+    // Validate all files are PDFs
+    const invalidFiles = files.filter(file => file.mimetype !== 'application/pdf');
+    if (invalidFiles.length > 0) {
+      return res.status(400).json({ 
+        error: `Invalid file types found: ${invalidFiles.map(f => f.originalname).join(', ')}. Only PDF files are allowed.` 
+      });
+    }
+
+    console.log(`📄 Bulk PDF upload: ${files.length} files`);
+
+    // Get paper info
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(paperId) }
+    });
+
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+
+    const results = [];
+    const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+
+    // Process each PDF file
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+      const file = files[fileIndex];
+      console.log(`📄 Processing PDF ${fileIndex + 1}/${files.length}: ${file.originalname}`);
+
+      try {
+        // Validate and get PDF info
+        const pdfInfo = await pdfService.getPDFInfo(file.buffer);
+        if (!pdfInfo.isValid) {
+          results.push({
+            fileName: file.originalname,
+            success: false,
+            error: 'Invalid PDF: ' + pdfInfo.error
+          });
+          continue;
+        }
+
+        // Upload PDF directly to MinIO without processing
+        const fileIdentifier = `bulk${fileIndex + 1}`;
+        const timestamp = Date.now();
+        const fileName = `pending_pdf_${fileIdentifier}_${timestamp}_${cleanTestName}.pdf`;
+        
+        console.log(`📤 Uploading bulk PDF ${fileIndex + 1}: ${fileName}`);
+        
+        const uploadResult = await minioService.uploadTempAnswerSheet(
+          file.buffer,
+          fileName,
+          `Bulk PDF ${fileIndex + 1} - ${file.originalname}`,
+          'unknown'
+        );
+        
+        console.log(`✅ Bulk PDF ${fileIndex + 1} uploaded: ${uploadResult.objectName}`);
+
+        // Create submission record with PDF reference
+        
+        const submission = await prisma.studentSubmission.create({
+          data: {
+            paperId: parseInt(paperId),
+            studentName: `PDF Bulk ${fileIndex + 1}`,
+            rollNo: "unknown",
+            imageUrl: uploadResult.objectName, // Store PDF object name
+            score: 0,
+            totalQuestions: 0,
+            percentage: 0,
+            submittedAt: new Date(),
+            answerTypes: {},
+            evaluationMethod: 'pdf_pending',
+            evaluationStatus: 'pending'
+          }
+        });
+
+        results.push({
+          fileName: file.originalname,
+          success: true,
+          submissionId: submission.id,
+          pdfPages: pdfInfo.pages,
+          fileSize: (file.size / 1024 / 1024).toFixed(2) + 'MB',
+          storedAs: fileName
+        });
+
+      } catch (fileError) {
+        console.error(`❌ Error processing ${file.originalname}:`, fileError);
+        results.push({
+          fileName: file.originalname,
+          success: false,
+          error: fileError.message
+        });
+      }
+    }
+
+    const successful = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
+
+    res.json({
+      success: true,
+      message: `Bulk PDF upload completed: ${successful} successful, ${failed} failed`,
+      paperName: paper.name,
+      totalFiles: files.length,
+      successful,
+      failed,
+      results,
+      evaluationMethod: 'bulk_pdf_extraction'
+    });
+
+  } catch (error) {
+    console.error('❌ Bulk PDF submission error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process bulk PDF submission: ' + error.message 
+    });
+  }
+});
+
+// Bulk Image upload route
+router.post('/submit-bulk-images', upload.array('imageFiles'), async (req, res) => {
+  try {
+    const { paperId } = req.body;
+    const files = req.files;
+
+    if (!paperId) {
+      return res.status(400).json({ error: 'Paper ID is required' });
+    }
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'At least one image file is required' });
+    }
+
+    // Validate all files are images
+    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png'];
+    const invalidFiles = files.filter(file => !allowedTypes.includes(file.mimetype));
+    if (invalidFiles.length > 0) {
+      return res.status(400).json({ 
+        error: `Invalid file types found: ${invalidFiles.map(f => f.originalname).join(', ')}. Only JPEG and PNG images are allowed.` 
+      });
+    }
+
+    console.log(`🖼️ Bulk image upload: ${files.length} files`);
+
+    // Get paper info
+    const paper = await prisma.paper.findUnique({
+      where: { id: parseInt(paperId) }
+    });
+
+    if (!paper) {
+      return res.status(404).json({ error: 'Paper not found' });
+    }
+
+    const results = [];
+    const cleanTestName = paper.name.replace(/[^a-zA-Z0-9]/g, '_');
+
+    // Process each image file
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+      const file = files[fileIndex];
+      console.log(`🖼️ Processing image ${fileIndex + 1}/${files.length}: ${file.originalname}`);
+
+      try {
+        // Upload image to MinIO
+        const fileIdentifier = `bulk${fileIndex + 1}`;
+        const fileName = `pending_image_${fileIdentifier}_${cleanTestName}.png`;
+        
+        console.log(`📤 Uploading image: ${fileName}`);
+        
+        const uploadResult = await minioService.uploadTempAnswerSheet(
+          file.buffer,
+          fileName,
+          `Bulk Image ${fileIndex + 1}`,
+          'unknown'
+        );
+
+        // Create submission record
+        const submission = await prisma.studentSubmission.create({
+          data: {
+            paperId: parseInt(paperId),
+            studentName: `Image Bulk ${fileIndex + 1}`,
+            rollNo: "unknown",
+            imageUrl: uploadResult.objectName,
+            score: 0,
+            totalQuestions: 0,
+            percentage: 0,
+            submittedAt: new Date(),
+            answerTypes: {},
+            evaluationMethod: 'pending',
+            evaluationStatus: 'pending'
+          }
+        });
+
+        results.push({
+          fileName: file.originalname,
+          success: true,
+          submissionId: submission.id,
+          uploadedImage: 1
+        });
+
+      } catch (fileError) {
+        console.error(`❌ Error processing ${file.originalname}:`, fileError);
+        results.push({
+          fileName: file.originalname,
+          success: false,
+          error: fileError.message
+        });
+      }
+    }
+
+    const successful = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
+
+    res.json({
+      success: true,
+      message: `Bulk image upload completed: ${successful} successful, ${failed} failed`,
+      paperName: paper.name,
+      totalFiles: files.length,
+      successful,
+      failed,
+      results,
+      evaluationMethod: 'bulk_image_upload'
+    });
+
+  } catch (error) {
+    console.error('❌ Bulk image submission error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process bulk image submission: ' + error.message 
+    });
+  }
+});
+
 // Get all submissions for a paper
 router.get('/paper/:paperId', async (req, res) => {
   try {
@@ -726,14 +1086,51 @@ router.post('/evaluate/:submissionId', async (req, res) => {
       orderBy: { questionNumber: 'asc' }
     });
 
-    // Get image URLs from submission
-    const imageUrls = submission.imageUrl.split(',');
+    // Check if this is a PDF submission
+    const isPdfSubmission = submission.evaluationMethod === 'pdf_pending' || 
+                           submission.imageUrl.endsWith('.pdf');
     
-    // Step 1: Download images from MinIO and process each one
+    console.log(`📄 File type: ${isPdfSubmission ? 'PDF' : 'Image'}`);
+
     let allStudentAnswers = [];
     let rollNoFromPaper = null;
+
+    if (isPdfSubmission) {
+      // Handle PDF submission
+      console.log('📄 Processing PDF submission...');
+      
+      try {
+        // Download PDF from MinIO
+        const pdfBuffer = await minioService.downloadImage(submission.imageUrl);
+        
+        // Extract content using Gemini Vision
+        const pdfResult = await pdfService.extractContentWithGemini(pdfBuffer);
+        
+        if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
+          rollNoFromPaper = pdfResult.rollNumber;
+          console.log(`📋 Extracted roll number from PDF: ${rollNoFromPaper}`);
+        }
+        
+        if (pdfResult.answers && Array.isArray(pdfResult.answers)) {
+          allStudentAnswers = pdfResult.answers;
+          console.log(`📝 Extracted ${allStudentAnswers.length} answers from PDF`);
+        } else {
+          console.log('⚠️ No answers extracted from PDF');
+        }
+        
+      } catch (pdfError) {
+        console.error('❌ Failed to process PDF:', pdfError);
+        return res.status(500).json({ 
+          error: 'Failed to process PDF: ' + pdfError.message 
+        });
+      }
+      
+    } else {
+      // Handle image submission (existing logic)
+      // Get image URLs from submission
+      const imageUrls = submission.imageUrl.split(',');
     
-    for (let i = 0; i < imageUrls.length; i++) {
+      for (let i = 0; i < imageUrls.length; i++) {
       const imageUrl = imageUrls[i];
       const pageNumber = i + 1;
       
@@ -779,6 +1176,7 @@ router.post('/evaluate/:submissionId', async (req, res) => {
         console.error(`❌ Failed to process page ${pageNumber}:`, imageError);
       }
     }
+    } // End of image processing
 
     // Step 2: Validate roll number
     if (rollNoFromPaper && rollNoFromPaper !== submission.rollNo) {
