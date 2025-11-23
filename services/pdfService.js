@@ -229,49 +229,28 @@ class PDFService {
       const pdfBase64 = pdfBuffer.toString('base64');
       
       const prompt = `
-        You are an expert at analyzing MCQ answer sheets from PDF documents. This is a MULTI-PAGE PDF document that you must analyze completely and dynamically.
+        Analyze this student answer sheet PDF and extract the roll number and marked answers.
 
-        YOUR TASK:
-        1. Analyze ALL pages in this PDF to understand the structure
-        2. Extract the student's roll number from wherever it appears
-        3. Identify ALL questions and their marked answers across all pages
-        4. Handle multiple pages with proper question numbering
+        ROLL NUMBER EXTRACTION (HIGHEST PRIORITY):
+        The roll number is typically found at the top of the first page in boxes or fields labeled "Roll No", "Roll Number", "Student ID", or similar.
+        It may be written in separate boxes (one digit per box) or in a single field.
 
-        ROLL NUMBER EXTRACTION:
-        - Look for roll number fields anywhere in the document
-        - Common patterns: "Roll Number:", "Roll No:", "ID:", "Student ID:", "Registration No:"
-        - The number could be handwritten, typed, or in boxes
-        - Extract the complete number as found in the document
-        - If no roll number is visible, return "unknown"
-
-        DYNAMIC QUESTION DETECTION:
-        - Scan ALL pages to find question numbers and their options
+        Look for:
+        1. Boxes at the top of the page with digits
+        2. Fields labeled "Roll No", "Roll Number", "Student ID"
+        3. Student information section at the top
+        4. Any numeric identifier that appears to be a roll number
+        
+        ANSWER DETECTION:
+        - Scan ALL pages to find question numbers and their marked options
+        - Look for checkmarks (✓, ✔, √), circles, filled bubbles, crosses, or any markings
         - Questions may be numbered 1-10, 1-20, Q1-Q10, etc.
-        - Each question typically has options like (a), (b), (c), (d) or A, B, C, D
-        - Determine the actual question numbering pattern from the document
-        - Count how many questions exist on each page
+        - Options are typically (a), (b), (c), (d) or A, B, C, D
 
-        ANSWER MARK DETECTION:
-        - Look for ANY type of marking that indicates a selected answer:
-          * Checkmarks (✓, ✔, √)
-          * Crosses (✗, ×)
-          * Filled circles or bubbles
-          * Circled letters
-          * Heavy pen marks
-          * Highlighting or underlining
-        - Multiple marks per question are common - capture ALL of them
-        - Even faint or partial marks should be included
-
-        PAGE HANDLING:
-        - If multiple pages exist, determine how questions are distributed
-        - Pages might have: Q1-10 each, or Q1-10 then Q11-20, or other patterns
-        - Renumber questions appropriately if needed to avoid duplicates
-        - Track which page each answer comes from
-
-        RETURN FORMAT - Return ONLY valid JSON:
+        Return ONLY a JSON object with this exact format:
         {
-          "rollNumber": "extracted_number_or_unknown",
-          "extractedContent": "Description of what was found in the document",
+          "rollNumber": "XX",
+          "extractedContent": "Description of what was found",
           "answers": [
             {
               "question": 1,
@@ -280,40 +259,17 @@ class PDFService {
               "confidence": "high",
               "markType": "checkmark",
               "pageNumber": 1
-            },
-            {
-              "question": 3,
-              "selectedOption": "c",
-              "selectedOptions": ["c", "d"],
-              "confidence": "high",
-              "markType": "checkmark",
-              "pageNumber": 1
             }
           ],
           "totalPages": 2,
           "questionCount": 20,
-          "extractionMethod": "gemini_vision_dynamic",
-          "confidence": "high"
+          "extractionMethod": "gemini_vision_pdf",
+          "confidence": "high",
+          "rollNumberLocation": "description of where roll number was found"
         }
 
-        PROCESSING INSTRUCTIONS:
-        1. First scan: Identify document structure, pages, and roll number location
-        2. Second scan: Map all questions and their positions across pages
-        3. Third scan: Detect all marked answers for each identified question
-        4. Renumber questions if multiple pages have overlapping numbers
-        5. Return ALL findings - do not skip questions even if no marks are found
-
-        CRITICAL RULES:
-        - Extract roll number exactly as it appears (no assumptions)
-        - Find actual question count and numbering from the document
-        - Include every question that has ANY visible mark
-        - selectedOption = first/primary marked option
-        - selectedOptions = array of ALL marked options for that question
-        - pageNumber = which page the question appears on
-        - confidence: "high" for clear marks, "medium" for visible marks, "low" for faint marks
-        - markType: describe the actual type of mark you see
-
-        IMPORTANT: Do not make assumptions about the content. Extract everything dynamically from what you actually see in the PDF.
+        If no roll number is found, use "unknown" for rollNumber.
+        Extract only the actual digits/numbers for roll number, without any labels.
       `;
       
       const imagePart = {

@@ -748,8 +748,68 @@ router.post('/submit-pdf', uploadPDF.single('answerSheet'), async (req, res) => 
     
     console.log(`✅ PDF uploaded successfully: ${uploadResult.objectName}`);
 
-    // Create submission record with PDF reference
+    // Check for existing submission with the same PDF to prevent duplicates
+    // Check by object name, file name, or recent timestamp
+    const existingSubmission = await prisma.studentSubmission.findFirst({
+      where: {
+        paperId: parseInt(paperId),
+        OR: [
+          { imageUrl: uploadResult.objectName },
+          { imageUrl: { contains: fileName } },
+          {
+            AND: [
+              { studentName: "PDF Submission" },
+              { submittedAt: { gte: new Date(Date.now() - 10 * 60 * 1000) } } // Last 10 minutes
+            ]
+          }
+        ]
+      },
+      orderBy: { submittedAt: 'desc' }
+    });
     
+    if (existingSubmission) {
+      console.log(`⚠️ PDF already exists with submission ID: ${existingSubmission.id}`);
+      
+      // If it's already evaluated, return an error
+      if (existingSubmission.evaluationStatus === 'evaluated') {
+        return res.status(409).json({
+          success: false,
+          error: 'This PDF has already been uploaded and evaluated for this paper',
+          existingSubmissionId: existingSubmission.id,
+          status: existingSubmission.evaluationStatus,
+          score: existingSubmission.score.toString(),
+          rollNo: existingSubmission.rollNo
+        });
+      } else {
+        // If pending, update the imageUrl and return existing submission
+        const updated = await prisma.studentSubmission.update({
+          where: { id: existingSubmission.id },
+          data: {
+            imageUrl: uploadResult.objectName,
+            submittedAt: new Date() // Update timestamp
+          }
+        });
+        
+        return res.json({
+          success: true,
+          message: 'PDF re-uploaded successfully, updated existing submission',
+          submission: {
+            id: updated.id,
+            paperId: updated.paperId,
+            studentName: updated.studentName,
+            rollNo: updated.rollNo,
+            submittedAt: updated.submittedAt,
+            evaluationStatus: updated.evaluationStatus,
+            evaluationMethod: updated.evaluationMethod
+          },
+          fileName: fileName,
+          fileSize: (file.size / 1024 / 1024).toFixed(2) + 'MB',
+          note: 'Updated existing pending submission instead of creating duplicate'
+        });
+      }
+    }
+    
+    // Create submission record with PDF reference
     const submission = await prisma.studentSubmission.create({
       data: {
         paperId: parseInt(paperId),
@@ -765,6 +825,9 @@ router.post('/submit-pdf', uploadPDF.single('answerSheet'), async (req, res) => 
         evaluationStatus: 'pending'
       }
     });
+    
+    // Cleanup any potential duplicates after submission
+    setImmediate(() => cleanupDuplicateSubmissions(paperId));
 
     res.json({
       success: true,
@@ -1103,12 +1166,35 @@ router.post('/evaluate/:submissionId', async (req, res) => {
         // Download PDF from MinIO
         const pdfBuffer = await minioService.downloadImage(submission.imageUrl);
         
-        // Extract content using Gemini Vision
+        // Extract content using Gemini Vision with enhanced debugging
+        console.log(`🤖 Starting Gemini PDF analysis...`);
         const pdfResult = await pdfService.extractContentWithGemini(pdfBuffer);
         
-        if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
-          rollNoFromPaper = pdfResult.rollNumber;
-          console.log(`📋 Extracted roll number from PDF: ${rollNoFromPaper}`);
+        console.log(`📋 PDF extraction result:`, {
+          rollNumber: pdfResult.rollNumber,
+          answersCount: pdfResult.answers?.length || 0,
+          extractionMethod: pdfResult.extractionMethod,
+          confidence: pdfResult.confidence
+        });
+        
+        if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown' && pdfResult.rollNumber.trim() !== '') {
+          rollNoFromPaper = pdfResult.rollNumber.trim();
+          console.log(`✅ Successfully extracted roll number from PDF: '${rollNoFromPaper}'`);
+          
+          // CRITICAL: Immediately update submission with extracted roll number during evaluation
+          try {
+            await prisma.studentSubmission.update({
+              where: { id: submissionId },
+              data: { rollNo: rollNoFromPaper }
+            });
+            console.log(`✅ Updated submission ${submissionId} roll number: '${rollNoFromPaper}'`);
+          } catch (updateError) {
+            console.warn('⚠️ Failed to update roll number during evaluation:', updateError.message);
+          }
+        } else {
+          console.log(`⚠️ Roll number extraction failed or returned unknown:`, pdfResult.rollNumber);
+          // Try alternative extraction methods if available
+          rollNoFromPaper = 'unknown';
         }
         
         if (pdfResult.answers && Array.isArray(pdfResult.answers)) {
@@ -1211,19 +1297,32 @@ router.post('/evaluate/:submissionId', async (req, res) => {
     
     // Step 4: Store results in database
     await prisma.$transaction(async (tx) => {
-      // Update submission with appropriate max score
+      // Update submission with appropriate max score and roll number if extracted
       const maxScore = evaluationResult.maxPossibleScore || evaluationResult.totalQuestions;
+      
+      // Prepare update data
+      const updateData = {
+        score: evaluationResult.score,
+        totalQuestions: evaluationResult.totalQuestions,
+        percentage: evaluationResult.percentage,
+        evaluationStatus: 'evaluated',
+        evaluationMethod: `admin_triggered_${evaluationResult.evaluationMethod || 'traditional'}`,
+        answerTypes: evaluationResult.answerTypes || {}
+      };
+      
+      // Update roll number if extracted from PDF and different from submission
+      if (rollNoFromPaper && rollNoFromPaper !== 'unknown' && rollNoFromPaper !== submission.rollNo) {
+        console.log(`📋 Updating roll number: ${submission.rollNo} → ${rollNoFromPaper}`);
+        updateData.rollNo = rollNoFromPaper;
+      } else if (rollNoFromPaper && rollNoFromPaper === 'unknown' && submission.rollNo === 'unknown') {
+        // If both are unknown, try to extract from filename or set a default
+        console.log(`⚠️ Roll number still unknown, attempting fallback extraction...`);
+        // You could add additional extraction logic here if needed
+      }
       
       await tx.studentSubmission.update({
         where: { id: submissionId },
-        data: {
-          score: evaluationResult.score,
-          totalQuestions: evaluationResult.totalQuestions,
-          percentage: evaluationResult.percentage,
-          evaluationStatus: 'evaluated',
-          evaluationMethod: `admin_triggered_${evaluationResult.evaluationMethod || 'traditional'}`,
-          answerTypes: evaluationResult.answerTypes || {}
-        }
+        data: updateData
       });
 
       // Store individual answers
@@ -1251,14 +1350,16 @@ router.post('/evaluate/:submissionId', async (req, res) => {
       }
     });
 
-    console.log(`✅ Evaluation completed for ${submission.studentName} (Roll: ${submission.rollNo})`);
+    const finalRollNo = rollNoFromPaper && rollNoFromPaper !== 'unknown' ? rollNoFromPaper : submission.rollNo;
+    
+    console.log(`✅ Evaluation completed for ${submission.studentName} (Roll: ${finalRollNo})`);
     console.log(`📊 Score: ${evaluationResult.score}/${evaluationResult.maxPossibleScore || evaluationResult.totalQuestions} (${evaluationResult.percentage}%)`);
 
     res.json({
       success: true,
       message: 'Evaluation completed successfully',
       studentName: submission.studentName,
-      rollNo: submission.rollNo,
+      rollNo: finalRollNo,
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
       maxPossibleScore: evaluationResult.maxPossibleScore || evaluationResult.totalQuestions,
@@ -1335,13 +1436,21 @@ router.get('/paper/:paperId/status/:status', async (req, res) => {
       paperName: submission.paper.name
     }));
 
-    console.log(`📊 Returning ${transformedSubmissions.length} evaluated submissions for paper ${paperId}`);
+    console.log(`📊 Returning ${transformedSubmissions.length} ${status} submissions for paper ${paperId}`);
     console.log('Sample submission data:', transformedSubmissions[0] || 'No submissions');
+
+    // Add cache-busting headers to ensure frontend gets fresh data
+    res.set({
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
 
     res.json({
       status: status,
       count: transformedSubmissions.length,
-      submissions: transformedSubmissions
+      submissions: transformedSubmissions,
+      timestamp: new Date().toISOString() // Add timestamp for debugging
     });
   } catch (error) {
     console.error('Error fetching submissions by status:', error);
@@ -1510,20 +1619,30 @@ router.get('/pending-files/:paperId', async (req, res) => {
       
       console.log(`📊 Found ${pendingFromDB.length} pending database submissions for this paper`);
       
-      // Filter out MinIO files that correspond to already evaluated submissions
+      // Enhanced filtering to remove any files/submissions that have been evaluated
       pendingSubmissions = pendingSubmissions.filter(minioSubmission => {
         const alreadyEvaluated = evaluatedSubmissions.some(evaluated => {
           // Check if this MinIO file corresponds to an already evaluated submission
-          // by checking if the imageUrl contains the same file names
           if (evaluated.imageUrl) {
             const evaluatedFileNames = evaluated.imageUrl.split(',').map(url => {
               // Extract filename from URL or path
               return url.trim().split('/').pop() || '';
             });
             
-            return evaluatedFileNames.some(fileName => {
-              return fileName === minioSubmission.fileName || minioSubmission.fileName.includes(fileName);
+            // Check multiple ways files might match
+            const matchFound = evaluatedFileNames.some(fileName => {
+              return fileName === minioSubmission.fileName || 
+                     minioSubmission.fileName.includes(fileName) ||
+                     fileName.includes(minioSubmission.fileName) ||
+                     // Check for timestamp-based matches (same base name, different timestamp)
+                     (fileName.replace(/\d+/g, '') === minioSubmission.fileName.replace(/\d+/g, ''));
             });
+            
+            // Also check if student name and roll number match
+            const nameMatch = evaluated.studentName === minioSubmission.studentName && 
+                             evaluated.rollNo === minioSubmission.rollNo;
+            
+            return matchFound || nameMatch;
           }
           return false;
         });
@@ -1671,6 +1790,96 @@ router.get('/pending-files/:paperId', async (req, res) => {
   }
 });
 
+// Helper function to cleanup duplicate submissions automatically
+const cleanupDuplicateSubmissions = async (paperId) => {
+  try {
+    console.log(`🧹 Checking for duplicate submissions in paper ${paperId}...`);
+    
+    // Find all submissions for this paper
+    const submissions = await prisma.studentSubmission.findMany({
+      where: { paperId: parseInt(paperId) },
+      orderBy: [{ evaluationStatus: 'desc' }, { submittedAt: 'desc' }] // Evaluated first, then by newest
+    });
+    
+    if (submissions.length <= 1) {
+      return; // No duplicates possible
+    }
+    
+    // Group by similar characteristics to identify duplicates
+    const groups = new Map();
+    
+    submissions.forEach(submission => {
+      // Create a key based on paper and file similarity
+      let groupKey;
+      if (submission.imageUrl) {
+        // Extract base filename without timestamps for grouping
+        const baseName = submission.imageUrl
+          .split('/')
+          .pop()
+          .replace(/\d{10,}/g, 'TIMESTAMP') // Replace long numbers with placeholder
+          .replace(/pending_|evaluated_/g, ''); // Remove status prefixes
+        groupKey = `${paperId}_${baseName}_${submission.studentName}`;
+      } else {
+        groupKey = `${paperId}_${submission.studentName}_${submission.rollNo}`;
+      }
+      
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, []);
+      }
+      groups.get(groupKey).push(submission);
+    });
+    
+    // Process each group to remove duplicates
+    for (const [key, groupSubmissions] of groups) {
+      if (groupSubmissions.length > 1) {
+        console.log(`🔍 Found ${groupSubmissions.length} potential duplicates in group: ${key}`);
+        
+        // Sort: evaluated submissions first, then by score desc, then by newest
+        groupSubmissions.sort((a, b) => {
+          if (a.evaluationStatus !== b.evaluationStatus) {
+            return a.evaluationStatus === 'evaluated' ? -1 : 1;
+          }
+          if (a.evaluationStatus === 'evaluated') {
+            return parseFloat(b.score) - parseFloat(a.score); // Higher score first
+          }
+          return new Date(b.submittedAt) - new Date(a.submittedAt); // Newer first
+        });
+        
+        // Keep the first one (best), remove others
+        const keepSubmission = groupSubmissions[0];
+        const removeSubmissions = groupSubmissions.slice(1);
+        
+        console.log(`✅ Keeping submission ID ${keepSubmission.id} (${keepSubmission.evaluationStatus}, score: ${keepSubmission.score})`);
+        
+        for (const removeSubmission of removeSubmissions) {
+          console.log(`🗑️ Removing duplicate submission ID ${removeSubmission.id} (${removeSubmission.evaluationStatus}, score: ${removeSubmission.score})`);
+          
+          try {
+            // Delete answers first
+            await prisma.studentAnswer.deleteMany({
+              where: { submissionId: removeSubmission.id }
+            });
+            
+            // Delete submission
+            await prisma.studentSubmission.delete({
+              where: { id: removeSubmission.id }
+            });
+            
+            console.log(`✅ Successfully removed duplicate submission ID ${removeSubmission.id}`);
+          } catch (deleteError) {
+            console.error(`❌ Failed to remove submission ${removeSubmission.id}:`, deleteError.message);
+          }
+        }
+      }
+    }
+    
+    console.log(`✅ Cleanup completed for paper ${paperId}`);
+    
+  } catch (error) {
+    console.error(`❌ Cleanup failed for paper ${paperId}:`, error.message);
+  }
+};
+
 // Helper function to retry database operations
 const retryDatabaseOperation = async (operation, maxRetries = 3, delay = 1000) => {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1725,9 +1934,12 @@ router.post('/evaluate-pending', async (req, res) => {
       orderBy: { questionNumber: 'asc' }
     });
     
-    // For submissions from database, find existing submission by ID instead of roll number
+    // Always find or identify the existing submission to avoid duplicates
     let existingSubmission = null;
+    let submissionToUpdate = null;
+    
     if (submissionId) {
+      // Direct submission ID provided (from database)
       existingSubmission = await prisma.studentSubmission.findFirst({
         where: {
           id: parseInt(submissionId),
@@ -1738,30 +1950,64 @@ router.post('/evaluate-pending', async (req, res) => {
       if (existingSubmission && existingSubmission.evaluationStatus === 'evaluated') {
         return res.status(400).json({ error: 'This submission has already been evaluated' });
       }
+      
+      submissionToUpdate = existingSubmission;
     } else {
-      // For MinIO file submissions, try to find existing submission by imageUrl pattern
-      // This handles the case where files were uploaded and a submission was created
+      // For MinIO/file submissions, find by file pattern or object name
       console.log(`🔍 Looking for existing submission for paperId: ${paperId}`);
       
-      const recentSubmissions = await prisma.studentSubmission.findMany({
-        where: {
-          paperId: parseInt(paperId),
-          studentName: "File Submission",
-          evaluationStatus: 'pending'
-        },
-        orderBy: { submittedAt: 'desc' },
-        take: 10 // Check recent submissions
-      });
+      // First, try to find by exact imageUrl match if we know the file path
+      if (pages && pages.length > 0) {
+        const firstFileId = pages[0].fileId;
+        if (firstFileId) {
+          existingSubmission = await prisma.studentSubmission.findFirst({
+            where: {
+              paperId: parseInt(paperId),
+              OR: [
+                { imageUrl: firstFileId },
+                { imageUrl: { contains: firstFileId.split('/').pop() } }
+              ]
+            },
+            orderBy: { submittedAt: 'desc' }
+          });
+          
+          if (existingSubmission) {
+            console.log(`🎯 Found existing submission by file match: ID ${existingSubmission.id}`);
+            submissionToUpdate = existingSubmission;
+          }
+        }
+      }
       
-      console.log(`📊 Found ${recentSubmissions.length} recent pending submissions`);
-      
-      // Try to match by similar file patterns or recent timing
-      if (recentSubmissions.length > 0) {
-        // Use the most recent pending submission for this paper
-        existingSubmission = recentSubmissions[0];
-        console.log(`🎯 Using existing submission ID: ${existingSubmission.id}`);
+      // If no exact match, look for recent pending submissions
+      if (!submissionToUpdate) {
+        const recentSubmissions = await prisma.studentSubmission.findMany({
+          where: {
+            paperId: parseInt(paperId),
+            OR: [
+              { studentName: "File Submission" },
+              { studentName: "PDF Submission" }
+            ],
+            evaluationStatus: 'pending'
+          },
+          orderBy: { submittedAt: 'desc' },
+          take: 5 // Check recent submissions
+        });
+        
+        console.log(`📊 Found ${recentSubmissions.length} recent pending submissions`);
+        
+        if (recentSubmissions.length > 0) {
+          submissionToUpdate = recentSubmissions[0];
+          console.log(`🎯 Using most recent pending submission: ID ${submissionToUpdate.id}`);
+        }
       }
     }
+    
+    // Ensure we have a submission to update
+    if (!submissionToUpdate) {
+      return res.status(404).json({ error: 'No pending submission found to evaluate' });
+    }
+    
+    existingSubmission = submissionToUpdate;
     
     // Handle multi-page or single page submission
     console.log(`🔍 Initial values: fileId=${fileId}, fileName=${fileName}, source=${source}`);
@@ -1915,9 +2161,15 @@ router.post('/evaluate-pending', async (req, res) => {
             // Use PDF service to extract content directly
             const pdfResult = await pdfService.extractContentWithGemini(imageBuffer);
             
-            if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
-              allStudentAnswers.rollNumber = pdfResult.rollNumber;
-              console.log(`📋 Extracted roll number from PDF: ${pdfResult.rollNumber}`);
+            console.log(`📋 Database PDF extraction result:`, {
+              rollNumber: pdfResult.rollNumber,
+              answersCount: pdfResult.answers?.length || 0,
+              extractionMethod: pdfResult.extractionMethod
+            });
+            
+            if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown' && pdfResult.rollNumber.trim() !== '') {
+              allStudentAnswers.rollNumber = pdfResult.rollNumber.trim();
+              console.log(`✅ Database PDF roll number extracted: '${pdfResult.rollNumber.trim()}'`);
             }
             
             if (pdfResult.answers && Array.isArray(pdfResult.answers)) {
@@ -2187,10 +2439,23 @@ router.post('/evaluate-pending', async (req, res) => {
     // Create or update submission in database
     const maxScore = evaluationResult.maxPossibleScore || evaluationResult.totalQuestions;
     
+    // Determine final roll number with priority: PDF extraction > page extraction > existing submission > unknown
+    const finalRollNo = allStudentAnswers.rollNumber || 
+                       pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || 
+                       existingSubmission?.rollNo || 
+                       "unknown";
+    
+    console.log(`📋 Final roll number determination:`, {
+      fromPDF: allStudentAnswers.rollNumber,
+      fromPageExtraction: pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo,
+      fromExistingSubmission: existingSubmission?.rollNo,
+      finalValue: finalRollNo
+    });
+
     const submissionData = {
       paperId: parseInt(paperId),
       studentName: "File Submission",
-      rollNo: pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || "unknown",
+      rollNo: finalRollNo,
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
       percentage: evaluationResult.percentage,
@@ -2205,25 +2470,23 @@ router.post('/evaluate-pending', async (req, res) => {
     try {
       submission = await retryDatabaseOperation(async () => {
         return await prisma.$transaction(async (tx) => {
-          let txSubmission;
+          // ALWAYS update existing submission - never create new ones during evaluation
+          console.log(`🔄 Updating existing submission ID: ${existingSubmission.id}`);
           
-          if (existingSubmission) {
-            // Update existing submission
-            txSubmission = await tx.studentSubmission.update({
-              where: { id: existingSubmission.id },
-              data: submissionData
-            });
-            
-            // Delete old answers
-            await tx.studentAnswer.deleteMany({
-              where: { submissionId: existingSubmission.id }
-            });
-          } else {
-            // Create new submission
-            txSubmission = await tx.studentSubmission.create({
-              data: submissionData
-            });
-          }
+          const txSubmission = await tx.studentSubmission.update({
+            where: { id: existingSubmission.id },
+            data: {
+              ...submissionData,
+              // Ensure we keep the original submission metadata but update evaluation results
+              studentName: existingSubmission.studentName, // Preserve original name
+              submittedAt: existingSubmission.submittedAt   // Preserve original timestamp
+            }
+          });
+          
+          // Delete old answers before inserting new ones
+          await tx.studentAnswer.deleteMany({
+            where: { submissionId: existingSubmission.id }
+          });
           
           // Store individual answers in batch
           if (evaluationResult.results && evaluationResult.results.length > 0) {
@@ -2358,7 +2621,7 @@ router.post('/evaluate-pending', async (req, res) => {
       message: 'Evaluation completed successfully',
       submissionId: submission.id,
       studentName: "File Submission",
-      rollNo: pagesToProcess.find(p => p.extractedRollNo)?.extractedRollNo || "unknown",
+      rollNo: finalRollNo,
       score: evaluationResult.score,
       totalQuestions: evaluationResult.totalQuestions,
       maxPossibleScore: evaluationResult.maxPossibleScore,
@@ -2411,7 +2674,8 @@ router.post('/reset-to-pending/:submissionId', async (req, res) => {
         evaluationStatus: 'pending',
         score: 0,
         totalQuestions: 0,
-        percentage: 0
+        percentage: 0,
+        rollNo: 'unknown' // Reset roll number too
       }
     });
     
@@ -2421,6 +2685,64 @@ router.post('/reset-to-pending/:submissionId', async (req, res) => {
     });
     
     res.json({ success: true, message: 'Submission reset to pending status' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Fix roll number for existing submission
+router.post('/fix-rollno/:submissionId', async (req, res) => {
+  try {
+    const submissionId = parseInt(req.params.submissionId);
+    
+    // Get submission
+    const submission = await prisma.studentSubmission.findUnique({
+      where: { id: submissionId }
+    });
+    
+    if (!submission) {
+      return res.status(404).json({ error: 'Submission not found' });
+    }
+    
+    // If it's a PDF, try to extract roll number
+    if (submission.imageUrl && submission.imageUrl.endsWith('.pdf')) {
+      console.log('📄 Attempting to extract roll number from PDF...');
+      
+      try {
+        // Download PDF and extract roll number
+        const pdfBuffer = await minioService.downloadImage(submission.imageUrl);
+        const pdfResult = await pdfService.extractContentWithGemini(pdfBuffer);
+        
+        if (pdfResult.rollNumber && pdfResult.rollNumber !== 'unknown') {
+          // Update submission with extracted roll number
+          const updated = await prisma.studentSubmission.update({
+            where: { id: submissionId },
+            data: {
+              rollNo: pdfResult.rollNumber.trim()
+            }
+          });
+          
+          res.json({ 
+            success: true, 
+            message: 'Roll number extracted and updated',
+            oldRollNo: submission.rollNo,
+            newRollNo: updated.rollNo
+          });
+        } else {
+          res.json({ 
+            success: false, 
+            message: 'Could not extract roll number from PDF',
+            extractionResult: pdfResult
+          });
+        }
+      } catch (extractError) {
+        res.status(500).json({ 
+          error: 'Failed to extract roll number: ' + extractError.message 
+        });
+      }
+    } else {
+      res.status(400).json({ error: 'Submission is not a PDF' });
+    }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2669,5 +2991,181 @@ async function evaluateSubmissionWithRetry(submission, paperId, maxRetries = 3) 
 
   throw lastError || new Error(`Failed after ${maxRetries} attempts`);
 }
+
+// Fix roll number for existing submission by re-extracting from PDF
+router.post('/fix-rollno-extraction/:submissionId', async (req, res) => {
+  try {
+    const submissionId = parseInt(req.params.submissionId);
+    
+    // Get submission
+    const submission = await prisma.studentSubmission.findUnique({
+      where: { id: submissionId }
+    });
+    
+    if (!submission) {
+      return res.status(404).json({ error: 'Submission not found' });
+    }
+    
+    console.log(`🔧 Fixing roll number extraction for submission ${submissionId}`);
+    console.log(`📄 Image URL: ${submission.imageUrl}`);
+    
+    let extractedRollNumber = null;
+    
+    try {
+      // Check if it's a PDF file
+      const isPdfFile = submission.imageUrl && 
+                       (submission.imageUrl.endsWith('.pdf') || 
+                        submission.evaluationMethod?.includes('pdf'));
+      
+      if (isPdfFile) {
+        console.log('📄 Processing PDF for roll number extraction...');
+        
+        // Download PDF and extract roll number
+        const pdfBuffer = await minioService.downloadImage(submission.imageUrl);
+        console.log(`✅ PDF downloaded, size: ${pdfBuffer.length} bytes`);
+        
+        // Use enhanced PDF extraction with focus on roll number
+        const pdfResult = await pdfService.extractContentWithGemini(pdfBuffer);
+        
+        console.log('📋 PDF extraction result:');
+        console.log(`  Roll Number: '${pdfResult.rollNumber}'`);
+        console.log(`  Answers Count: ${pdfResult.answers?.length || 0}`);
+        console.log(`  Extraction Method: ${pdfResult.extractionMethod}`);
+        console.log(`  Confidence: ${pdfResult.confidence}`);
+        if (pdfResult.rollNumberLocation) {
+          console.log(`  Roll Number Location: ${pdfResult.rollNumberLocation}`);
+        }
+        
+        if (pdfResult.rollNumber && 
+            pdfResult.rollNumber !== 'unknown' && 
+            pdfResult.rollNumber.trim() !== '' && 
+            pdfResult.rollNumber !== 'null') {
+          extractedRollNumber = pdfResult.rollNumber.trim();
+          console.log(`✅ Successfully extracted roll number: '${extractedRollNumber}'`);
+        } else {
+          console.log('⚠️ No valid roll number found in PDF');
+        }
+        
+      } else {
+        console.log('🖼️ Processing image for roll number extraction...');
+        
+        // For image files, use Gemini to extract roll number
+        const imageBuffer = await minioService.downloadImage(submission.imageUrl);
+        const rollNoResult = await geminiService.extractRollNumberFromImage(imageBuffer);
+        
+        if (rollNoResult.success && rollNoResult.rollNumber !== 'unknown') {
+          extractedRollNumber = rollNoResult.rollNumber;
+          console.log(`✅ Successfully extracted roll number from image: '${extractedRollNumber}'`);
+        }
+      }
+      
+      // Update submission with extracted roll number
+      if (extractedRollNumber) {
+        const updated = await prisma.studentSubmission.update({
+          where: { id: submissionId },
+          data: {
+            rollNo: extractedRollNumber
+          }
+        });
+        
+        res.json({
+          success: true,
+          message: 'Roll number extracted and updated successfully',
+          oldRollNo: submission.rollNo,
+          newRollNo: updated.rollNo,
+          extractionMethod: isPdfFile ? 'pdf_gemini_vision' : 'image_gemini_vision',
+          submissionId: submissionId
+        });
+      } else {
+        res.json({
+          success: false,
+          message: 'Could not extract roll number from submission',
+          currentRollNo: submission.rollNo,
+          extractionMethod: isPdfFile ? 'pdf_gemini_vision' : 'image_gemini_vision',
+          submissionId: submissionId
+        });
+      }
+      
+    } catch (extractError) {
+      console.error('❌ Roll number extraction failed:', extractError);
+      res.status(500).json({
+        error: 'Failed to extract roll number: ' + extractError.message,
+        submissionId: submissionId
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Fix roll number error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Manual cleanup duplicates for a paper
+router.post('/cleanup-duplicates/:paperId', async (req, res) => {
+  try {
+    const paperId = parseInt(req.params.paperId);
+    
+    console.log(`\ud83e\uddf9 Manual cleanup triggered for paper ${paperId}`);
+    await cleanupDuplicateSubmissions(paperId);
+    
+    // Return current state
+    const remainingSubmissions = await prisma.studentSubmission.findMany({
+      where: { paperId: paperId },
+      select: {
+        id: true,
+        studentName: true,
+        rollNo: true,
+        evaluationStatus: true,
+        score: true,
+        submittedAt: true
+      },
+      orderBy: { submittedAt: 'desc' }
+    });
+    
+    res.json({
+      success: true,
+      message: `Cleanup completed for paper ${paperId}`,
+      remainingSubmissions: remainingSubmissions,
+      count: remainingSubmissions.length
+    });
+  } catch (error) {
+    console.error('\u274c Manual cleanup error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Manual cleanup duplicates for a paper
+router.post('/cleanup-duplicates/:paperId', async (req, res) => {
+  try {
+    const paperId = parseInt(req.params.paperId);
+    
+    console.log(`🧹 Manual cleanup triggered for paper ${paperId}`);
+    await cleanupDuplicateSubmissions(paperId);
+    
+    // Return current state
+    const remainingSubmissions = await prisma.studentSubmission.findMany({
+      where: { paperId: paperId },
+      select: {
+        id: true,
+        studentName: true,
+        rollNo: true,
+        evaluationStatus: true,
+        score: true,
+        submittedAt: true
+      },
+      orderBy: { submittedAt: 'desc' }
+    });
+    
+    res.json({
+      success: true,
+      message: `Cleanup completed for paper ${paperId}`,
+      remainingSubmissions: remainingSubmissions,
+      count: remainingSubmissions.length
+    });
+  } catch (error) {
+    console.error('❌ Manual cleanup error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 module.exports = router;
