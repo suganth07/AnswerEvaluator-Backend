@@ -1,5 +1,14 @@
-# Use Node.js LTS Alpine image
-FROM node:18-alpine
+# Use Node.js LTS with full image (not Alpine) for better PDF/image processing compatibility
+FROM node:18-slim
+
+# Install system dependencies for PDF processing and sharp
+RUN apt-get update && apt-get install -y \
+    curl \
+    graphicsmagick \
+    ghostscript \
+    poppler-utils \
+    libvips-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
@@ -7,8 +16,8 @@ WORKDIR /app
 # Copy package.json and package-lock.json
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install dependencies (use npm install to handle lock file differences)
+RUN npm install --omit=dev
 
 # Copy application code (excluding node_modules)
 COPY src ./src

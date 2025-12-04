@@ -1,11 +1,18 @@
 const pdf2pic = require('pdf2pic');
-const { PDFParse } = require('pdf-parse');
 const sharp = require('sharp');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
+
+// pdf-parse is optional - we primarily use Gemini Vision for PDF analysis
+let pdfParse = null;
+try {
+  pdfParse = require('pdf-parse');
+} catch (error) {
+  console.warn('⚠️ pdf-parse not available, using Gemini Vision for PDF analysis');
+}
 
 class PDFService {
   constructor() {
@@ -32,23 +39,36 @@ class PDFService {
     try {
       console.log('🔍 Analyzing PDF buffer...', { size: pdfBuffer.length });
       
-      // Create PDFParse instance
-      const parser = new PDFParse({ data: pdfBuffer });
+      // Try to use pdf-parse if available
+      if (pdfParse) {
+        try {
+          const result = await pdfParse(pdfBuffer);
+          
+          console.log('📄 PDF parsed successfully:', {
+            pages: result.numpages,
+            textLength: result.text ? result.text.length : 0
+          });
+          
+          return {
+            isValid: true,
+            pages: result.numpages || 1,
+            fileSize: pdfBuffer.length,
+            wordCount: result.text ? result.text.split(' ').length : 0,
+            text: result.text || ''
+          };
+        } catch (parseError) {
+          console.warn('⚠️ pdf-parse failed, using fallback:', parseError.message);
+        }
+      }
       
-      // Extract text content
-      const result = await parser.getText();
-      
-      console.log('📄 PDF parsed successfully:', {
-        pages: result.total,
-        textLength: result.text ? result.text.length : 0
-      });
-      
+      // Fallback: Just validate it's a PDF and estimate pages
+      const isPdf = pdfBuffer.slice(0, 4).toString() === '%PDF';
       return {
-        isValid: true,
-        pages: result.total,
+        isValid: isPdf,
+        pages: 1, // Default to 1 page
         fileSize: pdfBuffer.length,
-        wordCount: result.text ? result.text.split(' ').length : 0,
-        text: result.text || ''
+        wordCount: 0,
+        text: ''
       };
     } catch (error) {
       console.error('❌ PDF parsing failed:', error.message);
@@ -91,9 +111,15 @@ class PDFService {
       const convert = pdf2pic.fromPath(pdfPath, convertOptions);
       
       // Get total number of pages first
-      const parser = new PDFParse({ data: pdfBuffer });
-      const textResult = await parser.getText();
-      const totalPages = textResult.total;
+      let totalPages = 1;
+      if (pdfParse) {
+        try {
+          const parseResult = await pdfParse(pdfBuffer);
+          totalPages = parseResult.numpages || 1;
+        } catch (parseError) {
+          console.warn('⚠️ Could not determine page count, defaulting to 1');
+        }
+      }
       
       console.log(`📊 PDF has ${totalPages} pages`);
       
@@ -160,33 +186,40 @@ class PDFService {
     try {
       console.log('📝 Extracting text from PDF using Gemini Vision...');
       
-      // First try standard text extraction
-      const parser = new PDFParse({ data: pdfBuffer });
-      const textResult = await parser.getText();
+      let textResult = { text: '', numpages: 1 };
       
-      // If we got meaningful text, return it
-      if (textResult.text && textResult.text.trim().length > 50) {
-        const result = {
-          text: textResult.text,
-          pages: textResult.total,
-          extractionMethod: 'text',
-          wordCount: textResult.text.split(' ').length,
-          lineCount: textResult.text.split('\n').length
-        };
-        
-        console.log(`📊 Extracted text: ${result.wordCount} words, ${result.lineCount} lines, ${result.pages} pages`);
-        return result;
+      // First try standard text extraction if pdf-parse is available
+      if (pdfParse) {
+        try {
+          textResult = await pdfParse(pdfBuffer);
+          
+          // If we got meaningful text, return it
+          if (textResult.text && textResult.text.trim().length > 50) {
+            const result = {
+              text: textResult.text,
+              pages: textResult.numpages || 1,
+              extractionMethod: 'text',
+              wordCount: textResult.text.split(' ').length,
+              lineCount: textResult.text.split('\n').length
+            };
+            
+            console.log(`📊 Extracted text: ${result.wordCount} words, ${result.lineCount} lines, ${result.pages} pages`);
+            return result;
+          }
+        } catch (parseError) {
+          console.warn('⚠️ pdf-parse text extraction failed:', parseError.message);
+        }
       }
       
-      // If text extraction failed, use Gemini for image-based extraction
-      console.log('📷 PDF contains images, using Gemini Vision for content extraction...');
+      // If text extraction failed or not available, use Gemini for image-based extraction
+      console.log('📷 Using Gemini Vision for content extraction...');
       
       try {
         const geminiResult = await this.extractContentWithGemini(pdfBuffer);
         
         return {
           text: geminiResult.extractedContent,
-          pages: textResult.total,
+          pages: textResult.numpages || 1,
           extractionMethod: geminiResult.extractionMethod,
           rollNumber: geminiResult.rollNumber,
           answers: geminiResult.answers,
@@ -202,7 +235,7 @@ class PDFService {
         // Return basic text extraction result even if Gemini fails
         return {
           text: textResult.text || 'Failed to extract text content',
-          pages: textResult.total,
+          pages: textResult.numpages || 1,
           extractionMethod: 'basic_fallback',
           error: geminiError.message,
           wordCount: (textResult.text || '').split(' ').length,
